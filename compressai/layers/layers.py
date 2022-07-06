@@ -43,11 +43,13 @@ from .gdn import GDN
 __all__ = [
     "AttentionBlock",
     "MaskedConv2d",
+    "CrossMaskedConv2d",
     "MultistageMaskedConv2d",
     "ResidualBlock",
     "ResidualBlockUpsample",
     "ResidualBlockWithStride",
     "conv3x3",
+    "conv1x1",
     "subpel_conv3x3",
     "QReLU",
     "RSTB",
@@ -77,6 +79,28 @@ class MaskedConv2d(nn.Conv2d):
         _, _, h, w = self.mask.size()
         self.mask[:, :, h // 2, w // 2 + (mask_type == "B") :] = 0
         self.mask[:, :, h // 2 + 1 :] = 0
+
+    def forward(self, x: Tensor) -> Tensor:
+        # TODO(begaintj): weight assigment is not supported by torchscript
+        self.weight.data *= self.mask
+        return super().forward(x)
+
+
+class CrossMaskedConv2d(nn.Conv2d):
+    r"""Masked 2D convolution implementation, mask future "unseen" pixels.
+    Checkerboard Pattern
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        size = self.kernel_size[0]
+        row_odd = [0., 1.] * (size // 2) + [0.]  # 0 1 0 1 ... 0
+        row_even = [1., 0.] * (size // 2) + [1.]  # 1 0 1 0 ... 1
+        mask = [row_odd, row_even] * (size // 2) + [row_odd]
+        mask = Tensor(mask).to(self.weight.data.device)      
+        
+        self.register_buffer("mask", mask)
+        
 
     def forward(self, x: Tensor) -> Tensor:
         # TODO(begaintj): weight assigment is not supported by torchscript

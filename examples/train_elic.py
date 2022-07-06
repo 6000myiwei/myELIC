@@ -55,6 +55,28 @@ class RateDistortionLoss(nn.Module):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
+    
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+        weight = [0.5, 0.5, 1]
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)) * w
+            for w, likelihoods in zip(output["likelihoods"].values(), weight)
+        )
+        out["mse_loss"] = self.mse(output["x_hat"], target)
+        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
+
+        return out
+
+class RateDistortionLossTwoPath(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=1e-2):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
 
     def forward(self, output, target):
         N, _, H, W = target.size()
@@ -166,7 +188,6 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        ##TODO input training stage to the model
         out_net = model(d)
 
         out_criterion = criterion(out_net, d)
@@ -232,7 +253,7 @@ def parse_args(argv):
     parser.add_argument(
         "-m",
         "--model",
-        default="tinylic",
+        default="elic",
         choices=image_models.keys(),
         help="Model architecture (default: %(default)s)",
     )

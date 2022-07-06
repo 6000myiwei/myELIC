@@ -1,0 +1,5 @@
+*.so
+*.o
+.vscode/*
+*.pyc
+*egg-info
