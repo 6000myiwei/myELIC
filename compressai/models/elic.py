@@ -1,7 +1,11 @@
 #%%
 import math
+import string
+from telnetlib import DM
 from tokenize import group
 from turtle import forward, shape
+from matplotlib.pyplot import xlabel
+from numpy import average
 import torch
 import torch.nn as nn
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
@@ -11,7 +15,7 @@ from timm.models.layers import trunc_normal_
 from enum import Enum
 from compressai.utils.bench.codecs import Codec
 
-from utils import conv, deconv, update_registered_buffers, Demultiplexer, Multiplexer
+from utils import conv, deconv, update_registered_buffers, CheckerboardDemux, CheckerboardMux
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -29,6 +33,7 @@ class CodecStageEnum(Enum):
     TEST = 4
     COMPRESS = 5
     DECOMPRESS = 6
+    Check = 7
 
 class ResBottleneck(nn.Module):
     """Simple residual unit."""
@@ -281,7 +286,7 @@ class ContextIterator(nn.Module):
         y_slices = next(y_slice_iter)
         shape_in = y_slices.shape
         y_context_space = self._sub_modules_space[0](y_slices, stage)
-        y_context_channel = torch.zeros((shape_in[0], self.groups[0] * 2, shape_in[2], shape_in[3])).to(y_slices.device)
+        y_context_channel = None
         yield y_context_space, y_context_channel
         for y_next_slice, channel_sub, space_sub in zip(y_slice_iter, self._sub_modules_channel, self._sub_modules_space[1:]):
             y_context_space = space_sub(y_next_slice, stage)
@@ -389,6 +394,9 @@ class ELIC(nn.Module):
         self.ste_quant = STEQuant()
         self.stage = stage
         
+        self.Mux = CheckerboardMux
+        self.Demux = CheckerboardDemux
+        
 
     def aux_loss(self):
         """Return the aggregated loss over the auxiliary entropy bottleneck
@@ -415,7 +423,7 @@ class ELIC(nn.Module):
         """
         if scale_table is None:
             scale_table = get_scale_table()
-        self.gaussian_conditional.update_scale_table(scale_table, force=force)
+        self.y_entorpy.update_scale_table(scale_table, force=force)
 
         updated = False
         for m in self.children():
@@ -425,8 +433,8 @@ class ELIC(nn.Module):
             updated |= rv
         return updated
     
-    def forward(self, x, stage):
-        if stage == CodecStageEnum.TRAIN:
+    def forward(self, x):
+        if self.stage == CodecStageEnum.TRAIN:
             y = self.g_a(x)
             z = self.h_a(y)
             
@@ -477,7 +485,7 @@ class ELIC(nn.Module):
             # set y_hat non anchor part to zero
             y_sp1_anchor[..., 0::2, 1::2] = 0
             y_sp1_anchor[..., 1::2, 0::2] = 0
-            y_sp1_ctx = self.contextiter._sub_modules_space[0](y_sp1_anchor, stage)
+            y_sp1_ctx = self.contextiter._sub_modules_space[0](y_sp1_anchor, self.stage)
             # set ctx anchor part ctx to zero
             y_sp1_ctx[..., 0::2, 0::2] = 0
             y_sp1_ctx[..., 1::2, 1::2] = 0
@@ -493,11 +501,11 @@ class ELIC(nn.Module):
                 y_ch_ctx = self.contextiter._sub_modules_channel[i-1](y_slices)
                 mu, _ = torch.chunk(self.y_parameter._sub_modules[i](torch.cat([zero_ctx, y_ch_ctx, hyper], 1)), 2, 1)
                 
-                y_sp_anchor = self.ste_quant(y_new_slice - mu)
+                y_sp_anchor = self.ste_quant(y_new_slice - mu) + mu
                 # set y_hat non anchor part to zero
                 y_sp_anchor[..., 0::2, 1::2] = 0
                 y_sp_anchor[..., 1::2, 0::2] = 0
-                y_sp_ctx = self.contextiter._sub_modules_space[i](y_sp_anchor, stage)
+                y_sp_ctx = self.contextiter._sub_modules_space[i](y_sp_anchor, self.stage)
                 # set ctx anchor part ctx to zero
                 y_sp_ctx[..., 0::2, 0::2] = 0
                 y_sp_ctx[..., 1::2, 1::2] = 0
@@ -510,7 +518,7 @@ class ELIC(nn.Module):
             
             mu = torch.cat(mu_list, 1)
             sigma = torch.cat(sigma_list, 1)    
-            _, y_likelihoods = self.y_entorpy(y_slices, sigma, means=mu)
+            _, y_likelihoods = self.y_entorpy(y, sigma, means=mu)
             x_hat = self.g_s(y_slices)
             
             return {
@@ -518,13 +526,144 @@ class ELIC(nn.Module):
                 "likelihoods": {"y":y_likelihoods,"z":z_likelihoods}
             }
             
+    def compress(self, x):
+            y = self.g_a(x)
+            z = self.h_a(y)
             
-
-
+            z_strings = self.entropy_bottleneck.compress(z)
+            z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+            
+            hyper = self.h_s(z_hat)
+            
+            shape_in = y.shape
+            mu_list = []
+            sigma_list = []
+            y_slice_iter = self.sliceModel(y)
+            
+            # process the first slice, without channle ctx
+            y_slices = y_slice_iter[0]
+            zero_ctx = torch.zeros(shape_in[0],self.groups[0] * 2, shape_in[2], shape_in[3]).to(y.device)
+            
+            mu, _ = torch.chunk(self.y_parameter._sub_modules[0](torch.cat([zero_ctx, hyper], 1)), 2, 1)
+            # y_sp1_anchor = self.ste_quant(y_slices - mu) + mu
+            y_sp1_anchor = self.y_entorpy.quantize(y_slices, "dequantize", means=mu)
+            # set y_hat non anchor part to zero
+            y_sp1_anchor[..., 0::2, 1::2] = 0
+            y_sp1_anchor[..., 1::2, 0::2] = 0
+            y_sp1_ctx = self.contextiter._sub_modules_space[0](y_sp1_anchor, self.stage)
+            # set ctx anchor part ctx to zero
+            y_sp1_ctx[..., 0::2, 0::2] = 0
+            y_sp1_ctx[..., 1::2, 1::2] = 0
+            mu_hat, sigma_hat = torch.chunk(self.y_parameter._sub_modules[0](torch.cat([y_sp1_ctx, hyper], 1)), 2, 1)
+            mu_list.append(mu_hat)
+            sigma_list.append(sigma_hat) 
+            
+            # y_slices = self.ste_quant(y_slices - mu_hat) + mu_hat
+            y_slices = self.y_entorpy.quantize(y_slices, "dequantize", means=mu_hat)
+            
+            for i in range(1, self.n_groups):  
+                y_new_slice = y_slice_iter[i]
+                zero_ctx = torch.zeros(shape_in[0],self.groups[i] * 2, shape_in[2], shape_in[3]).to(y.device)
+                y_ch_ctx = self.contextiter._sub_modules_channel[i-1](y_slices)
+                mu, _ = torch.chunk(self.y_parameter._sub_modules[i](torch.cat([zero_ctx, y_ch_ctx, hyper], 1)), 2, 1)
+                
+                # y_sp_anchor = self.ste_quant(y_new_slice - mu) + mu
+                y_sp_anchor = self.y_entorpy.quantize(y_new_slice, "dequantize", means=mu)
+                # set y_hat non anchor part to zero
+                y_sp_anchor[..., 0::2, 1::2] = 0
+                y_sp_anchor[..., 1::2, 0::2] = 0
+                y_sp_ctx = self.contextiter._sub_modules_space[i](y_sp_anchor, self.stage)
+                # set ctx anchor part to zero
+                y_sp_ctx[..., 0::2, 0::2] = 0
+                y_sp_ctx[..., 1::2, 1::2] = 0
+                mu_hat, sigma_hat = torch.chunk(self.y_parameter._sub_modules[i](torch.cat([y_sp_ctx, y_ch_ctx, hyper], 1)), 2, 1)
+                
+                mu_list.append(mu_hat)
+                sigma_list.append(sigma_hat)
+                # y_new_slice = self.ste_quant(y_new_slice - mu_hat) + mu_hat
+                y_new_slice = self.y_entorpy.quantize(y_new_slice, "dequantize", means=mu_hat)
+                y_slices = torch.cat([y_slices, y_new_slice], 1)
+            
+            mu = torch.cat(mu_list, 1)
+            sigma = torch.cat(sigma_list, 1)
+            
+            y_string_list = []
+            for y_slice, mu, sigma in zip(self.sliceModel(y_slices), mu_list, sigma_list):
+                y1, y2 = self.Demux(y_slice)
+                mu1, mu2 = self.Demux(mu)
+                sigma1, sigma2 = self.Demux(sigma)
+                indexes_y1 = self.y_entorpy.build_indexes(sigma1)
+                indexes_y2 = self.y_entorpy.build_indexes(sigma2)
+                y1_strings = self.y_entorpy.compress(y1, indexes_y1, means=mu1)
+                y2_strings = self.y_entorpy.compress(y2, indexes_y2, means=mu2)
+                y_string_list.append(y1_strings)
+                y_string_list.append(y2_strings)
+            
+            return {
+                "strings": [*y_string_list, z_strings],
+                "shape": z.size()[-2:],
+                "y" : y_slices if self.stage == CodecStageEnum.Check else None
+            }
+    
+    def decompress(self, strings, shape):
+        z_hat = self.entropy_bottleneck.decompress(strings[-1], shape)
+        hyper = self.h_s(z_hat)
+        shape_in = hyper.shape
+        
+        # first stage, without channle context
+        zero_ctx = torch.zeros(shape_in[0],self.groups[0] * 2, shape_in[2], shape_in[3]).to(hyper.device)
+        mu, sigma = torch.chunk(self.y_parameter._sub_modules[0](torch.cat([zero_ctx, hyper], 1)), 2, 1)
+        mu_hat, _ = self.Demux(mu)
+        sigma_hat, _ = self.Demux(sigma)
+        indexes_y1 = self.y_entorpy.build_indexes(sigma_hat)
+        y1 = self.y_entorpy.decompress(strings[0],indexes_y1, means=mu_hat)
+        
+        y_sp1_anchor = self.Mux(y1, torch.zeros_like(y1))
+        y_sp1_ctx = self.contextiter._sub_modules_space[0](y_sp1_anchor, self.stage)
+        # set ctx anchor part ctx to zero
+        # decompress stage neccessary?
+        # y_sp1_ctx[..., 0::2, 0::2] = 0
+        # y_sp1_ctx[..., 1::2, 1::2] = 0
+        mu, sigma = torch.chunk(self.y_parameter._sub_modules[0](torch.cat([y_sp1_ctx, hyper], 1)), 2, 1)
+        _, mu_hat = self.Demux(mu)
+        _, sigma_hat = self.Demux(sigma)
+        indexes_y1 = self.y_entorpy.build_indexes(sigma_hat)
+        y_slices = self.y_entorpy.decompress(strings[1], indexes_y1, means=mu_hat)
+        y_slices = self.Mux(torch.zeros_like(y_slices), y_slices)
+        
+        y_slices += y_sp1_anchor
+        
+        for i in range(1, self.n_groups):
+            zero_ctx = torch.zeros(shape_in[0],self.groups[i] * 2, shape_in[2], shape_in[3]).to(hyper.device)
+            y_ch_ctx = self.contextiter._sub_modules_channel[i-1](y_slices)
+            mu, sigma = torch.chunk(self.y_parameter._sub_modules[i](torch.cat([zero_ctx, y_ch_ctx, hyper], 1)), 2, 1)
+            mu_hat, _ = self.Demux(mu)
+            sigma_hat, _ = self.Demux(sigma)
+            indexes_y = self.y_entorpy.build_indexes(sigma_hat)
+            y = self.y_entorpy.decompress(strings[i * 2], indexes_y, means=mu_hat)
+            
+            y_sp_anchor = self.Mux(y, torch.zeros_like(y))
+            y_sp_ctx = self.contextiter._sub_modules_space[i](y_sp_anchor, self.stage)
+            # y_sp_ctx[..., 0::2, 0::2] = 0
+            # y_sp_ctx[..., 1::2, 1::2] = 0
+            mu, sigma = torch.chunk(self.y_parameter._sub_modules[i](torch.cat([y_sp_ctx, y_ch_ctx, hyper], 1)), 2, 1)
+            _, mu_hat = self.Demux(mu)
+            _, sigma_hat = self.Demux(sigma)
+            indexes_y = self.y_entorpy.build_indexes(sigma_hat)
+            y = self.y_entorpy.decompress(strings[i * 2 + 1], indexes_y, means=mu_hat)
+            y = self.Mux(torch.zeros_like(y), y)
+            
+            y_new_slice = y_sp_anchor + y
+            y_slices = torch.cat([y_slices, y_new_slice], dim=1)
+        
+        x_hat = self.g_s(y_slices)
+        return {
+            "x_hat" : x_hat,
+            "y" : y_slices if self.stage == CodecStageEnum.Check else None
+        }
 #%%
 if __name__ == "__main__":
     groups = [16,16,32,64,None]
-    stage = CodecStageEnum.TRAIN2
     
     # ga = YEncoder().cuda()
     # gs = YDecoder().cuda()
@@ -548,7 +687,46 @@ if __name__ == "__main__":
     # x_hat = gs(y)
     
     elic = ELIC().cuda()
-    x = torch.rand((2,3,256,256)).cuda()
-    data = elic(x, stage)
+    elic.stage = CodecStageEnum.Check
+    x = torch.rand((1,3,768,512)).cuda()
+    # data = elic(x, stage)
+    elic.update()
     
+    # ## 验证编解码正确性
+    # code = elic.compress(x)
+    # rec = elic.decompress(code['strings'], code['shape'])
+    # y1 = code['y']
+    # y2 = rec['y']
+    # total_bytes = 0                
+    # strings = code['strings']
+    # for s in strings:
+    #     if isinstance(s, list):
+    #         for i in s:
+    #             total_bytes += len(i)
+    #     else:
+    #         total_bytes += len(i)
+
+    # print(total_bytes * 8 / 768 / 512)
+    # print((y1 == y1).all())
+    
+    # 速度测试
+    import time
+    enc_time = []
+    dec_time = []
+    stage = CodecStageEnum.TEST
+    count = 20
+    for _ in range(count):  
+        t1 = time.process_time()
+        code = elic.compress(x)
+        t2 = time.process_time()
+        enc_time.append(t2 - t1)
+        
+        t1 = time.process_time()
+        rec = elic.decompress(code['strings'], code['shape'])
+        t2 = time.process_time()
+        dec_time.append(t2 - t1)
+    enc_time = sum(enc_time) / count
+    dec_time = sum(dec_time) / count
+    print("encode time: ", enc_time * 1000)
+    print("decode time: ", dec_time * 1000)
 #%%

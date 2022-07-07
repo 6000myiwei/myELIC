@@ -166,7 +166,6 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        ##TODO input training stage to the model
         out_net = model(d)
 
         out_criterion = criterion(out_net, d)

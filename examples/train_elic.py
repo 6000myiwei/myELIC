@@ -45,10 +45,33 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from compressai.datasets import ImageFolder
+from compressai.models.elic import CodecStageEnum
 from compressai.zoo import image_models
 
 
 class RateDistortionLoss(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=1e-2):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+        out["mse_loss"] = self.mse(output["x_hat"], target)
+        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
+
+        return out
+
+class RateDistortionLossTwoPath(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
     def __init__(self, lmbda=1e-2):
@@ -70,27 +93,6 @@ class RateDistortionLoss(nn.Module):
 
         return out
 
-class RateDistortionLossTwoPath(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
-
-    def __init__(self, lmbda=1e-2):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-
-    def forward(self, output, target):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
-
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
-        out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
-
-        return out
 
 
 class AverageMeter:
@@ -179,6 +181,8 @@ def configure_optimizers(net, args):
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
 ):
+    if epoch >= 3800:
+        model.stage = CodecStageEnum.TRAIN2
     model.train()
     device = next(model.parameters()).device
 
@@ -187,7 +191,8 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
-
+        
+        ##TODO input training stage to the model
         out_net = model(d)
 
         out_criterion = criterion(out_net, d)
@@ -404,7 +409,7 @@ def main(argv):
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300,500], gamma=0.1)
-    criterion = RateDistortionLoss(lmbda=args.lmbda)
+    criterion = RateDistortionLossTwoPath(lmbda=args.lmbda)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
@@ -420,6 +425,8 @@ def main(argv):
     for epoch in range(last_epoch, args.epochs):
         logging.info('======Current epoch %s ======'%epoch)
         logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        if epoch <= 3800:
+            criterion = RateDistortionLoss(lmbda=args.lmbda)
         train_one_epoch(
             net,
             criterion,

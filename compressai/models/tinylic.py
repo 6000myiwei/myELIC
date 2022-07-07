@@ -5,7 +5,7 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import RSTB, MultistageMaskedConv2d
 from timm.models.layers import trunc_normal_
 
-from .utils import conv, deconv, update_registered_buffers, Demultiplexer, Multiplexer
+from utils import conv, deconv, update_registered_buffers, Demultiplexer, Multiplexer
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -536,3 +536,30 @@ class TinyLIC(nn.Module):
         return {
             "x_hat": x_hat,
         }
+
+if __name__ == '__main__':
+    model = TinyLIC().cuda()
+    model.update()
+    x = torch.rand((1,3,768,512)).cuda()
+    code = model.compress(x)
+    rec = model.decompress(code['strings'], code['shape'])
+
+        # 速度测试
+    import time
+    enc_time = []
+    dec_time = []
+    count = 20
+    for _ in range(count):
+        t1 = time.process_time()
+        code = model.compress(x)
+        t2 = time.process_time()
+        enc_time.append(t2 - t1)
+        
+        t1 = time.process_time()
+        rec = model.decompress(code['strings'], code['shape'])
+        t2 = time.process_time()
+        dec_time.append(t2 - t1)
+    enc_time = sum(enc_time) / count
+    dec_time = sum(dec_time) / count
+    print("encode time: ", enc_time * 1000)
+    print("decode time: ", dec_time * 1000)

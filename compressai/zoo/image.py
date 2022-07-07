@@ -36,7 +36,8 @@ from compressai.models import (
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
     ScaleHyperprior,
-    TinyLIC
+    TinyLIC,
+    elic
 )
 
 from .pretrained import load_pretrained
