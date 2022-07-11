@@ -15,7 +15,7 @@ from timm.models.layers import trunc_normal_
 from enum import Enum
 from compressai.utils.bench.codecs import Codec
 
-from utils import conv, deconv, update_registered_buffers, CheckerboardDemux, CheckerboardMux
+from compressai.models.utils import conv, deconv, update_registered_buffers, CheckerboardDemux, CheckerboardMux
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11
@@ -28,12 +28,13 @@ def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
 
 class CodecStageEnum(Enum):
     TRAIN = 1
-    TRAIN2 = 2
-    VALID = 3
-    TEST = 4
-    COMPRESS = 5
-    DECOMPRESS = 6
-    Check = 7
+    TRAIN_ONEPATH=2
+    TRAIN2 = 3
+    VALID = 4
+    TEST = 5
+    COMPRESS = 6
+    DECOMPRESS = 7
+    Check = 8
 
 class ResBottleneck(nn.Module):
     """Simple residual unit."""
@@ -92,9 +93,9 @@ class YDecoder(nn.Module):
             StackResBottleneck(N, num_rsb),
             deconv(N, N, 5, 2),
             AttentionBlock(N),
-            StackResBottleneck(N),
+            StackResBottleneck(N, num_rsb),
             deconv(N, N, 5, 2),
-            StackResBottleneck(N),
+            StackResBottleneck(N, num_rsb),
             deconv(N, 3, 5, 2)
         )
     
@@ -179,12 +180,19 @@ class CheckerboardContext(nn.Module):
     def __init__(self, *maskconv_args, **maskconv_kwargs) -> None:
         super().__init__()
         self.cross_conv = CrossMaskedConv2d(*maskconv_args, **maskconv_kwargs)
+    
+    def gate(self, x):
+        x[..., 0::2, 0::2] = 0
+        x[..., 1::2, 1::2] = 0
+        return x
 
     def forward(self, x, stage):
         if stage == CodecStageEnum.TRAIN:
             checkerboard = self.cross_conv(x)
             anchor = torch.zeros(x.shape[0], x.shape[1] * 2, x.shape[2], x.shape[3]).to(x.device)
             return checkerboard, anchor
+        elif stage == CodecStageEnum.TRAIN_ONEPATH:
+            return self.gate(self.cross_conv(x))
         else:
             checkerboard = self.cross_conv(x)
             return checkerboard
@@ -209,6 +217,7 @@ class ChannelARParamTransform(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        # TODO channle number settings may not flexible
         c1 = self.out_channels
         c2 = self.out_channels * 3 // 2
         self._layers = nn.ModuleList([
@@ -286,12 +295,11 @@ class ContextIterator(nn.Module):
         y_slices = next(y_slice_iter)
         shape_in = y_slices.shape
         y_context_space = self._sub_modules_space[0](y_slices, stage)
-        y_context_channel = None
-        yield y_context_space, y_context_channel
+        yield (y_context_space,)
         for y_next_slice, channel_sub, space_sub in zip(y_slice_iter, self._sub_modules_channel, self._sub_modules_space[1:]):
             y_context_space = space_sub(y_next_slice, stage)
             y_context_channel = channel_sub(y_slices)
-            yield y_context_space, y_context_channel
+            yield (y_context_space, y_context_channel)
             y_slices = torch.cat([y_slices, y_next_slice], dim=1)
 
 class SpaceAndChannleParamIterater(nn.Module):
@@ -433,8 +441,24 @@ class ELIC(nn.Module):
             updated |= rv
         return updated
     
+    def load_state_dict(self, state_dict, strict=True):
+        # Dynamically update the entropy bottleneck buffers related to the CDFs
+        update_registered_buffers(
+            self.entropy_bottleneck,
+            "entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
+        update_registered_buffers(
+            self.y_entorpy,
+            "y_entorpy",
+            ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
+            state_dict,
+        )
+        super().load_state_dict(state_dict, strict=strict)
+    
     def forward(self, x):
-        if self.stage == CodecStageEnum.TRAIN:
+        if self.stage == CodecStageEnum.TRAIN or self.stage == CodecStageEnum.TRAIN_ONEPATH:
             y = self.g_a(x)
             z = self.h_a(y)
             
@@ -450,19 +474,29 @@ class ELIC(nn.Module):
             y_round = self.ste_quant(y)
             y_slice_iter = iter(self.sliceModel(y_hat))
             y_context_iter = self.contextiter(y_slice_iter, self.stage)
-            param = list(self.y_parameter(y_context_iter, hyper, self.stage))
-            entropy = ParamGroupTwoPath(param)
-            
-            mu1, sigma1 = entropy[1]
-            mu2, sigma2 = entropy[2]
-            _, y_likelihoods1 = self.y_entorpy(y, sigma1, means=mu1)
-            _, y_likelihoods2 = self.y_entorpy(y, sigma2, means=mu2)
-            
-            x_hat = self.g_s(y_round)
-            return {
-                "x_hat" : x_hat,
-                "likelihoods": {"y1":y_likelihoods1, "y2":y_likelihoods2,"z":z_likelihoods}
-            }
+            param = self.y_parameter(y_context_iter, hyper, self.stage)
+
+            if self.stage == CodecStageEnum.TRAIN:
+                entropy = ParamGroupTwoPath(param)
+                
+                mu1, sigma1 = entropy[1]
+                mu2, sigma2 = entropy[2]
+                _, y_likelihoods1 = self.y_entorpy(y, sigma1, means=mu1)
+                _, y_likelihoods2 = self.y_entorpy(y, sigma2, means=mu2)
+                
+                x_hat = self.g_s(y_round)
+                return {
+                    "x_hat" : x_hat,
+                    "likelihoods": {"y1":y_likelihoods1, "y2":y_likelihoods2,"z":z_likelihoods}
+                }
+            else:
+                mu, sigma = ParamGroup(param)
+                _, y_likelihoods = self.y_entorpy(y, sigma, means=mu)
+                x_hat = self.g_s(y_round)
+                return {
+                    "x_hat" : x_hat,
+                    "likelihoods": {"y":y_likelihoods, "z":z_likelihoods}
+                }
         else:
             y = self.g_a(x)
             z = self.h_a(y)
@@ -692,41 +726,41 @@ if __name__ == "__main__":
     # data = elic(x, stage)
     elic.update()
     
-    # ## 验证编解码正确性
-    # code = elic.compress(x)
-    # rec = elic.decompress(code['strings'], code['shape'])
-    # y1 = code['y']
-    # y2 = rec['y']
-    # total_bytes = 0                
-    # strings = code['strings']
-    # for s in strings:
-    #     if isinstance(s, list):
-    #         for i in s:
-    #             total_bytes += len(i)
-    #     else:
-    #         total_bytes += len(i)
+    ## 验证编解码正确性
+    code = elic.compress(x)
+    rec = elic.decompress(code['strings'], code['shape'])
+    y1 = code['y']
+    y2 = rec['y']
+    total_bytes = 0                
+    strings = code['strings']
+    for s in strings:
+        if isinstance(s, list):
+            for i in s:
+                total_bytes += len(i)
+        else:
+            total_bytes += len(i)
 
-    # print(total_bytes * 8 / 768 / 512)
-    # print((y1 == y1).all())
+    print(total_bytes * 8 / 768 / 512)
+    print((y1 == y1).all())
     
-    # 速度测试
-    import time
-    enc_time = []
-    dec_time = []
-    stage = CodecStageEnum.TEST
-    count = 20
-    for _ in range(count):  
-        t1 = time.process_time()
-        code = elic.compress(x)
-        t2 = time.process_time()
-        enc_time.append(t2 - t1)
+    # # 速度测试
+    # import time
+    # enc_time = []
+    # dec_time = []
+    # stage = CodecStageEnum.TEST
+    # count = 20
+    # for _ in range(count):  
+    #     t1 = time.process_time()
+    #     code = elic.compress(x)
+    #     t2 = time.process_time()
+    #     enc_time.append(t2 - t1)
         
-        t1 = time.process_time()
-        rec = elic.decompress(code['strings'], code['shape'])
-        t2 = time.process_time()
-        dec_time.append(t2 - t1)
-    enc_time = sum(enc_time) / count
-    dec_time = sum(dec_time) / count
-    print("encode time: ", enc_time * 1000)
-    print("decode time: ", dec_time * 1000)
+    #     t1 = time.process_time()
+    #     rec = elic.decompress(code['strings'], code['shape'])
+    #     t2 = time.process_time()
+    #     dec_time.append(t2 - t1)
+    # enc_time = sum(enc_time) / count
+    # dec_time = sum(dec_time) / count
+    # print("encode time: ", enc_time * 1000)
+    # print("decode time: ", dec_time * 1000)
 #%%

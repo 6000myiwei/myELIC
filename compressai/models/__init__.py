@@ -30,3 +30,4 @@
 from .google import *
 from .waseda import *
 from .tinylic import *
+from .elic import ELIC

@@ -5,7 +5,7 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import RSTB, MultistageMaskedConv2d
 from timm.models.layers import trunc_normal_
 
-from utils import conv, deconv, update_registered_buffers, Demultiplexer, Multiplexer
+from .utils import conv, deconv, update_registered_buffers, Demultiplexer, Multiplexer
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11

@@ -36,6 +36,7 @@ import os
 import time
 import logging
 from datetime import datetime
+from black import out
 
 import torch
 import torch.nn as nn
@@ -86,7 +87,7 @@ class RateDistortionLossTwoPath(nn.Module):
         weight = [0.5, 0.5, 1]
         out["bpp_loss"] = sum(
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)) * w
-            for w, likelihoods in zip(output["likelihoods"].values(), weight)
+            for likelihoods, w in zip(output["likelihoods"].values(), weight)
         )
         out["mse_loss"] = self.mse(output["x_hat"], target)
         out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
@@ -181,8 +182,6 @@ def configure_optimizers(net, args):
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
 ):
-    if epoch >= 3800:
-        model.stage = CodecStageEnum.TRAIN2
     model.train()
     device = next(model.parameters()).device
 
@@ -205,12 +204,14 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i*len(d) % 5000 == 0:
+        if i*len(d) % 4800 == 0:
             logging.info(
+                f'[epoch: {epoch}] | '
                 f'[{i*len(d)}/{len(train_dataloader.dataset)}] | '
                 # f" ({100. * i / len(train_dataloader):.0f}%)]"
                 f'Loss: {out_criterion["loss"].item():.3f} | '
                 f'MSE loss: {out_criterion["mse_loss"].item():.5f} | '
+                f'PSNR: {10 * torch.log10(1 / out_criterion["mse_loss"]).item():.3f} |'
                 f'Bpp loss: {out_criterion["bpp_loss"].item():.4f} | '
                 f"Aux loss: {aux_loss.item():.2f}"
             )
@@ -312,6 +313,7 @@ def parse_args(argv):
     parser.add_argument(
         "--aux-learning-rate",
         default=1e-3,
+        type=float,
         help="Auxiliary loss learning rate (default: %(default)s)",
     )
     parser.add_argument(
@@ -367,7 +369,7 @@ def main(argv):
     logging.info('=' * len(msg))
 
     train_transforms = transforms.Compose([
-        transforms.RandomCrop(args.patch_size), 
+        # transforms.RandomCrop(args.patch_size), 
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.ToTensor()
@@ -400,7 +402,7 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=int(args.quality_level))
+    net = image_models[args.model](quality=int(args.quality_level), stage=CodecStageEnum.TRAIN)
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
@@ -408,7 +410,7 @@ def main(argv):
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300,500], gamma=0.1)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[39], gamma=0.1)
     criterion = RateDistortionLossTwoPath(lmbda=args.lmbda)
 
     last_epoch = 0
@@ -425,8 +427,15 @@ def main(argv):
     for epoch in range(last_epoch, args.epochs):
         logging.info('======Current epoch %s ======'%epoch)
         logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        if epoch <= 3800:
+        if epoch >= 10 and epoch < 36:
             criterion = RateDistortionLoss(lmbda=args.lmbda)
+            net.stage =  CodecStageEnum.TRAIN_ONEPATH
+            logging.info("Training One Path")
+            
+        elif epoch >= 36:
+            criterion = RateDistortionLoss(lmbda=args.lmbda)
+            net.stage = CodecStageEnum.TRAIN2
+            logging.info("Training stage 2")
         train_one_epoch(
             net,
             criterion,

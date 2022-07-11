@@ -37,7 +37,7 @@ from compressai.models import (
     MeanScaleHyperprior,
     ScaleHyperprior,
     TinyLIC,
-    elic
+    ELIC
 )
 
 from .pretrained import load_pretrained
@@ -50,6 +50,7 @@ __all__ = [
     "cheng2020_anchor",
     "cheng2020_attn",
     "tinylic",
+    "elic"
 ]
 
 model_architectures = {
@@ -60,6 +61,7 @@ model_architectures = {
     "cheng2020-anchor": Cheng2020Anchor,
     "cheng2020-attn": Cheng2020Attention,
     "tinylic": TinyLIC,
+    "elic" : ELIC,
 }
 
 root_url = "https://compressai.s3.amazonaws.com/models/v1"
@@ -257,6 +259,16 @@ cfgs = {
         7: (192, 320),
         8: (192, 320),
     },
+    "elic": {
+        1: (192, 320),
+        2: (192, 320),
+        3: (192, 320),
+        4: (192, 320),
+        5: (192, 320),
+        6: (192, 320),
+        7: (192, 320),
+        8: (192, 320),
+    },
 }
 
 
@@ -442,3 +454,12 @@ def tinylic(quality, metric="mse", pretrained=False, progress=True, **kwargs):
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
 
     return _load_model("tinylic", metric, quality, pretrained, progress, **kwargs)
+
+def elic(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 8:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
+
+    return _load_model("elic", metric, quality, pretrained, progress, **kwargs)

@@ -26,7 +26,7 @@
 # WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+#%%
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -259,3 +259,39 @@ def Multiplexer(y1, y2, y3, y4):
     """
     x_prime = torch.cat((y1, y3, y4, y2), dim=1)
     return Depth2Space(r=2)(x_prime)
+
+def CheckerboardDemux(x):
+    """checkerboard demutiplexer
+
+    Args:
+        x:tensor
+
+    Returns:
+        y1: anchor, y2: non_anchor
+    """    
+    x_prime = Space2Depth(r=2)(x)
+    
+    _, C, _, _ = x_prime.shape
+    y1_index = tuple(range(0, C // 4)) + tuple(range(C * 3 // 4, C))
+    y2_index = tuple(range(C // 4, C * 3 // 4))
+    
+    y1 = torch.index_select(x_prime, 1, torch.as_tensor(y1_index, device=x.device))
+    y2 = torch.index_select(x_prime, 1, torch.as_tensor(y2_index, device=x.device))
+    return y1, y2
+
+def CheckerboardMux(y1, y2):
+    C = y1.shape[1]
+    x_prime = torch.cat([y1[:, :C // 2, ...], y2, y1[:, C // 2:, ...]], dim=1)
+    return Depth2Space(r=2)(x_prime)
+
+
+
+if __name__ == "__main__":
+    
+    x = torch.randint(0, 2*64*32*32, (2,64,32,32))
+    x[..., 0::2, 1::2] = 0
+    x[..., 1::2, 0::2] = 0
+    y1, y2 = CheckerboardDemux(x)
+    x_hat = CheckerboardMux(y1, y2)
+    print((x == x_hat).all())
+#%%
