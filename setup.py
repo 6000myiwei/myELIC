@@ -94,6 +94,26 @@ def get_extensions():
         )
     )
 
+    os.makedirs(cwd / 'compressai'/ 'McQuic', exist_ok=True)
+    mcquic_ext_dirs = cwd / "third_party/McQuic/cpp_exts"
+
+    # Add rANS module
+    mcquic_rans_lib_dir = cwd / "third_party/McQuic/ryg_rans"
+
+    if os.name == "nt":
+        compiler_args = ["/std:c++17", "/O2", "/GL", "/MP8"]
+    else:
+        compiler_args = ["-std=c++17", "-O3"]
+
+    ext_modules.append(
+        Pybind11Extension(
+            name=f"{package_name}.McQuic.rans",
+            sources=[str(s) for s in mcquic_ext_dirs.glob("*.cpp")],
+            language="c++",
+            include_dirs=[mcquic_rans_lib_dir, mcquic_ext_dirs],
+            extra_compile_args=compiler_args,
+        )
+    )
     return ext_modules
 
 

@@ -50,6 +50,9 @@ from compressai.models.elic import CodecStageEnum
 from compressai.zoo import image_models
 
 
+training_stage = [9999, 260, 280]
+double_lambda_trick_epoch = 150
+
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
 
@@ -204,7 +207,7 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i*len(d) % 4800 == 0:
+        if i*len(d) % 2000 == 0:
             logging.info(
                 f'[epoch: {epoch}] | '
                 f'[{i*len(d)}/{len(train_dataloader.dataset)}] | '
@@ -241,6 +244,7 @@ def test_epoch(epoch, test_dataloader, model, criterion):
         f"Test epoch {epoch}: Average losses: "
         f"Loss: {loss.avg:.3f} | "
         f"MSE loss: {mse_loss.avg:.5f} | "
+        f"PSNR: {10 * torch.log10(1 / mse_loss.avg).item():.3f} | "
         f"Bpp loss: {bpp_loss.avg:.4f} | "
         f"Aux loss: {aux_loss.avg:.2f}\n"
     )
@@ -349,6 +353,7 @@ def parse_args(argv):
         help='Result dir name', 
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
+    parser.add_argument("--optimizer", action="store_true", help="Whether load optimizer")
     args = parser.parse_args(argv)
     return args
 
@@ -369,7 +374,7 @@ def main(argv):
     logging.info('=' * len(msg))
 
     train_transforms = transforms.Compose([
-        # transforms.RandomCrop(args.patch_size), 
+        transforms.RandomCrop(args.patch_size), 
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.ToTensor()
@@ -410,32 +415,59 @@ def main(argv):
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[39], gamma=0.1)
-    criterion = RateDistortionLossTwoPath(lmbda=args.lmbda)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[training_stage[-1]], gamma=0.1)
+    lr_scheduler_aux = optim.lr_scheduler.MultiStepLR(aux_optimizer, milestones=[training_stage[-1]], gamma=0.1)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
         logging.info("Loading "+str(args.checkpoint))
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        last_epoch = checkpoint["epoch"] + 1
         net.load_state_dict(checkpoint["state_dict"], strict=False)
+    
+    if args.optimizer:
+        logging.info("Loading optimizer")
+        last_epoch = checkpoint["epoch"] + 1
+        
+        # checkpoint["optimizer"]['param_groups'][0]['lr'] = args.learning_rate
+        # checkpoint["aux_optimizer"]['param_groups'][0]['lr'] = args.aux_learning_rate
+        
         optimizer.load_state_dict(checkpoint["optimizer"])
         aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        
+        ## Temp Hack lr scheduler
+        # del checkpoint['lr_scheduler']['milestones']
+        # checkpoint['lr_scheduler']['_last_lr'] = args.learning_rate
+        
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-
+        
+        # checkpoint['lr_scheduler']['base_lrs'] = args.aux_learning_rate
+        # checkpoint['lr_scheduler']['_last_lr'] = args.aux_learning_rate
+        
+        # TODO add aux lr scheduler loader
+        lr_scheduler_aux.load_state_dict(checkpoint["lr_scheduler"])
+    
+    lmbda_value = args.lmbda * 2 if last_epoch <= double_lambda_trick_epoch else args.lmbda
+    criterion = RateDistortionLossTwoPath(lmbda=lmbda_value)
+    
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
         logging.info('======Current epoch %s ======'%epoch)
         logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        if epoch >= 10 and epoch < 36:
-            criterion = RateDistortionLoss(lmbda=args.lmbda)
+        logging.info(f"Aux Learning rate: {aux_optimizer.param_groups[0]['lr']}")
+        logging.info(f"using lambda: {lmbda_value}")
+        if epoch >= training_stage[0] and epoch < training_stage[1]:
+            criterion = RateDistortionLoss(lmbda=lmbda_value)
             net.stage =  CodecStageEnum.TRAIN_ONEPATH
             logging.info("Training One Path")
             
-        elif epoch >= 36:
-            criterion = RateDistortionLoss(lmbda=args.lmbda)
+        elif epoch >= training_stage[1]:
+            criterion = RateDistortionLoss(lmbda=lmbda_value)
             net.stage = CodecStageEnum.TRAIN2
             logging.info("Training stage 2")
+        
+        if epoch == double_lambda_trick_epoch:
+            lmbda_value /= 2
+            criterion.lmbda = lmbda_value
         train_one_epoch(
             net,
             criterion,
@@ -447,6 +479,7 @@ def main(argv):
         )
         loss = test_epoch(epoch, test_dataloader, net, criterion)
         lr_scheduler.step()
+        lr_scheduler_aux.step()
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
@@ -460,6 +493,7 @@ def main(argv):
                     "optimizer": optimizer.state_dict(),
                     "aux_optimizer": aux_optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
+                    "lr_scheduler_aux" : lr_scheduler_aux.state_dict()
                 },
                 is_best,
                 base_dir

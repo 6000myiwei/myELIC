@@ -1,11 +1,5 @@
 #%%
 import math
-import string
-from telnetlib import DM
-from tokenize import group
-from turtle import forward, shape
-from matplotlib.pyplot import xlabel
-from numpy import average
 import torch
 import torch.nn as nn
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
@@ -13,8 +7,6 @@ from compressai.layers import conv1x1,conv3x3, AttentionBlock, CrossMaskedConv2d
 from compressai.layers import Quantizator_RT, STEQuant
 from timm.models.layers import trunc_normal_
 from enum import Enum
-from compressai.utils.bench.codecs import Codec
-
 from compressai.models.utils import conv, deconv, update_registered_buffers, CheckerboardDemux, CheckerboardMux
 
 # From Balle's tensorflow compression examples
@@ -181,7 +173,9 @@ class CheckerboardContext(nn.Module):
         super().__init__()
         self.cross_conv = CrossMaskedConv2d(*maskconv_args, **maskconv_kwargs)
     
-    def gate(self, x):
+    def gate(self, checkerboard):
+        x = torch.clone(checkerboard)
+        
         x[..., 0::2, 0::2] = 0
         x[..., 1::2, 1::2] = 0
         return x
