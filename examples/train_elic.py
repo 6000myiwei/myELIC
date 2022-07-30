@@ -50,8 +50,8 @@ from compressai.models.elic import CodecStageEnum
 from compressai.zoo import image_models
 
 
-training_stage = [9999, 260, 280]
-double_lambda_trick_epoch = 150
+training_stage = [9999, 220, 240]
+double_lambda_trick_epoch = 240
 
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -151,7 +151,14 @@ def setup_logger(log_dir):
 def configure_optimizers(net, args):
     """Separate parameters for the main optimizer and the auxiliary optimizer.
     Return two optimizers"""
-
+    
+    opt_cls = optim.Adam
+    try:
+        from apex.optimizers import FusedAdam
+        logging.info('using apex FusedAdam')
+        opt_cls = FusedAdam
+    except ImportError:
+        logging.info('cannot load apex FusedAdam, using default Pytorch implementation')
     parameters = {
         n
         for n, p in net.named_parameters()
@@ -171,11 +178,11 @@ def configure_optimizers(net, args):
     assert len(inter_params) == 0
     assert len(union_params) - len(params_dict.keys()) == 0
 
-    optimizer = optim.Adam(
+    optimizer = opt_cls(
         (params_dict[n] for n in sorted(parameters)),
         lr=args.learning_rate,
     )
-    aux_optimizer = optim.Adam(
+    aux_optimizer = opt_cls(
         (params_dict[n] for n in sorted(aux_parameters)),
         lr=args.aux_learning_rate,
     )
@@ -361,6 +368,9 @@ def parse_args(argv):
 def main(argv):
     args = parse_args(argv)
     base_dir = init(args)
+    double_lambda_value = args.lmbda / 2
+    ## set to 0.015 for low bitrate model
+    # double_lambda_value = 0.015
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -407,6 +417,9 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
+    if device == "cuda":
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
     net = image_models[args.model](quality=int(args.quality_level), stage=CodecStageEnum.TRAIN)
     net = net.to(device)
 
@@ -446,7 +459,7 @@ def main(argv):
         # TODO add aux lr scheduler loader
         lr_scheduler_aux.load_state_dict(checkpoint["lr_scheduler"])
     
-    lmbda_value = args.lmbda * 2 if last_epoch <= double_lambda_trick_epoch else args.lmbda
+    lmbda_value = double_lambda_value if last_epoch >= double_lambda_trick_epoch[0] and last_epoch < double_lambda_trick_epoch[1] else args.lmbda
     criterion = RateDistortionLossTwoPath(lmbda=lmbda_value)
     
     best_loss = float("inf")
@@ -465,9 +478,13 @@ def main(argv):
             net.stage = CodecStageEnum.TRAIN2
             logging.info("Training stage 2")
         
-        if epoch == double_lambda_trick_epoch:
-            lmbda_value /= 2
+        if epoch >= double_lambda_trick_epoch[0] and epoch < double_lambda_trick_epoch[1]:
+            lmbda_value = double_lambda_value
             criterion.lmbda = lmbda_value
+        else:
+            lmbda_value = args.lmbda
+            criterion.lmbda = lmbda_value
+        
         train_one_epoch(
             net,
             criterion,
@@ -496,7 +513,9 @@ def main(argv):
                     "lr_scheduler_aux" : lr_scheduler_aux.state_dict()
                 },
                 is_best,
-                base_dir
+                base_dir,
+                filename = "checkpoint.pth.tar"
+                # filename="checkpoint.pth.tar" if epoch != double_lambda_trick_epoch[1] - 1 else "change.pth.tar"
             )
 
 

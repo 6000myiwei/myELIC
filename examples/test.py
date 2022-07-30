@@ -1,3 +1,4 @@
+from statistics import mode
 import torch
 import torch.nn as nn
 
@@ -16,9 +17,10 @@ import logging
 model = 'elic'
 
 dataset_path = '/hdd/zyw/ImageDataset'
-# checkpoint_path = './pretrained/elic/8/pretrain268.pth.tar'
-# checkpoint_path = './pretrained/elic/8/checkpoint_best_loss.pth.tar'
-checkpoint_path = './pretrained/elic/8/checkpoint.pth.tar'
+# checkpoint_path = './pretrained/elic/8/lambda0.9.pth.tar'
+# checkpoint_path = './pretrained/elic/8/lambda0.16.pth.tar'
+# checkpoint_path = './pretrained/elic/7/checkpoint_best_loss.pth.tar'
+checkpoint_path = './pretrained/elic/4/checkpoint.pth.tar'
 quality_level = 8
 stage = CodecStageEnum.TRAIN2
 
@@ -64,6 +66,43 @@ def test_epoch(test_dataloader, model, criterion):
 
     return loss.avg
 
+def real_test(test_dataloader, model):
+    model.eval()
+    model.update()
+    distortion = nn.MSELoss()
+    device = next(model.parameters()).device
+
+    bpp_loss = AverageMeter()
+    mse_loss = AverageMeter()
+
+    with torch.no_grad():
+        for d in test_dataloader:
+            d = d.to(device)
+            N, _, H, W = d.size()
+            code = model.compress(d)
+            rec = model.decompress(code['strings'], code['shape'])
+            total_bytes = 0                
+            strings = code['strings']
+        
+            for s in strings:
+                    if isinstance(s, list):
+                        for i in s:
+                            total_bytes += len(i)
+            else:
+                total_bytes += len(i)
+
+            bpp = total_bytes * 8 / H / W / N
+            mse = nn.MSELoss()(rec['x_hat'], d)
+            
+            bpp_loss.update(bpp)
+            mse_loss.update(mse)
+
+    logging.info(
+        f"MSE loss: {mse_loss.avg:.5f} | "
+        f"PSNR: {10 * torch.log10(1 / mse_loss.avg).item():.3f} | "
+        f"Bpp loss: {bpp_loss.avg:.4f} | \n"
+    )
+
 setup_logger()
 
 test_transforms = transforms.Compose([transforms.ToTensor()])
@@ -95,3 +134,4 @@ if stage == CodecStageEnum.TRAIN:
 else:
     criterion = RateDistortionLoss(lmbda=lambda_value)
 test_epoch(test_dataloader, net, criterion)
+# real_test(test_dataloader, net)

@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
-from compressai.layers import conv1x1,conv3x3, AttentionBlock, CrossMaskedConv2d
+from compressai.layers import conv1x1,conv3x3, AttentionBlock, CrossMaskedConv2d, ResBottleneck,StackResBottleneck
 from compressai.layers import Quantizator_RT, STEQuant
 from timm.models.layers import trunc_normal_
 from enum import Enum
@@ -28,34 +28,6 @@ class CodecStageEnum(Enum):
     DECOMPRESS = 7
     Check = 8
 
-class ResBottleneck(nn.Module):
-    """Simple residual unit."""
-
-    def __init__(self, N):
-        super().__init__()
-        self.conv = nn.Sequential(
-            conv1x1(N, N // 2),
-            nn.ReLU(inplace=True),
-            conv3x3(N // 2, N // 2),
-            nn.ReLU(inplace=True),
-            conv1x1(N // 2, N),
-        )
-
-    def forward(self, x):
-        identity = x
-        out = self.conv(x)
-        out += identity
-        return out
-
-class StackResBottleneck(nn.Module):
-    def __init__(self, N=192, num_rsb=3) -> None:
-        super().__init__()
-        self._layers = nn.ModuleList([ResBottleneck(N) for _ in range(num_rsb)])
-
-    def forward(self, x):
-        for layer in self._layers:
-            x = layer(x)
-        return x
 
 class YEncoder(nn.Module):
     def __init__(self, in_channels=3, N=192, M=320, num_rsb=3) -> None:
@@ -400,6 +372,15 @@ class ELIC(nn.Module):
         self.Demux = CheckerboardDemux
         
 
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        N = 192
+        M = 320
+        net = cls(N, M)
+        net.load_state_dict(state_dict)
+        return net
+
     def aux_loss(self):
         """Return the aggregated loss over the auxiliary entropy bottleneck
         module(s).
@@ -553,7 +534,8 @@ class ELIC(nn.Module):
                 "x_hat" : x_hat,
                 "likelihoods": {"y":y_likelihoods,"z":z_likelihoods}
             }
-            
+    
+    @torch.inference_mode()        
     def compress(self, x):
             y = self.g_a(x)
             z = self.h_a(y)
@@ -633,6 +615,7 @@ class ELIC(nn.Module):
                 "y" : y_slices if self.stage == CodecStageEnum.Check else None
             }
     
+    @torch.inference_mode()
     def decompress(self, strings, shape):
         z_hat = self.entropy_bottleneck.decompress(strings[-1], shape)
         hyper = self.h_s(z_hat)
@@ -691,6 +674,8 @@ class ELIC(nn.Module):
         }
 #%%
 if __name__ == "__main__":
+    from PIL import Image
+    from torchvision.transforms import ToTensor
     groups = [16,16,32,64,None]
     
     # ga = YEncoder().cuda()
@@ -715,8 +700,12 @@ if __name__ == "__main__":
     # x_hat = gs(y)
     
     elic = ELIC().cuda()
+    elic.eval()
     elic.stage = CodecStageEnum.Check
-    x = torch.rand((1,3,768,512)).cuda()
+    # x = torch.rand((1,3,768,512)).cuda()
+    img = Image.open('/hdd/zyw/ImageDataset/kodak/kodim01.png').convert("RGB")
+    x = ToTensor()(img).cuda()
+    x = x.unsqueeze(0)
     # data = elic(x, stage)
     elic.update()
     

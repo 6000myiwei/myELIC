@@ -54,6 +54,8 @@ __all__ = [
     "QReLU",
     "RSTB",
     "CausalAttentionModule",
+    "ResBottleneck",
+    "StackResBottleneck"
 ]
 
 
@@ -849,3 +851,33 @@ class CausalAttentionModule(nn.Module):
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2) # B, C_out, H, W
 
         return out
+
+class ResBottleneck(nn.Module):
+    """Simple residual unit."""
+
+    def __init__(self, N):
+        super().__init__()
+        self.conv = nn.Sequential(
+            conv1x1(N, N // 2),
+            nn.ReLU(inplace=True),
+            conv3x3(N // 2, N // 2),
+            nn.ReLU(inplace=True),
+            conv1x1(N // 2, N),
+        )
+
+    def forward(self, x):
+        identity = x
+        out = self.conv(x)
+        out += identity
+        return out
+
+
+class StackResBottleneck(nn.Module):
+    def __init__(self, N=192, num_rsb=3) -> None:
+        super().__init__()
+        self._layers = nn.ModuleList([ResBottleneck(N) for _ in range(num_rsb)])
+
+    def forward(self, x):
+        for layer in self._layers:
+            x = layer(x)
+        return x

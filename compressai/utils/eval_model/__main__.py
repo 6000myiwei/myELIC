@@ -48,6 +48,7 @@ from pytorch_msssim import ms_ssim
 from torchvision import transforms
 
 import compressai
+from compressai.models.elic import CodecStageEnum
 
 from compressai.zoo import image_models as pretrained_models
 from compressai.zoo import load_state_dict
@@ -162,7 +163,9 @@ def load_pretrained(model: str, metric: str, quality: int) -> nn.Module:
 
 def load_checkpoint(arch: str, checkpoint_path: str) -> nn.Module:
     state_dict = load_state_dict(torch.load(checkpoint_path)['state_dict'])
-    return architectures[arch].from_state_dict(state_dict).eval()
+    model = architectures[arch].from_state_dict(state_dict)
+    model.stage = CodecStageEnum.TEST
+    return model.eval()
 
 
 def eval_model(model, filepaths, entropy_estimation=False, half=False):
