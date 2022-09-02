@@ -28,6 +28,7 @@
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import warnings
+import math
 
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -41,6 +42,16 @@ from torch import Tensor
 
 from compressai._CXX import pmf_to_quantized_cdf as _pmf_to_quantized_cdf
 from compressai.ops import LowerBound
+
+
+SCALES_MIN = 0.11
+SCALES_MAX = 256
+SCALES_LEVELS = 64
+SKIP_INDEX = 1
+
+def get_scale_table(min=SCALES_MIN, max=SCALES_MAX, levels=SCALES_LEVELS):
+    return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
+
 
 
 class _EntropyCoder:
@@ -687,3 +698,244 @@ class GaussianConditional(EntropyModel):
         for s in self.scale_table[:-1]:
             indexes -= (scales <= s).int()
         return indexes
+
+class GaussianConditionalEntropySkip(GaussianConditional):
+    def __init__(
+        self,
+        scale_table: Optional[Union[List, Tuple]],
+        *args: Any,
+        scale_bound: float = 0.11,
+        tail_mass: float = 1e-9,
+        skipIndex = 0,
+        **kwargs: Any,
+    ):
+        super().__init__(scale_table, *args, scale_bound=scale_bound, tail_mass=tail_mass, **kwargs)
+        self.skipIndex = skipIndex
+        if self.skipIndex < 0:
+            self.skipThreshold = -100
+        else:
+            if len(self.scale_table) == 0:
+                self.skipThreshold = get_scale_table()[self.skipIndex]
+            else:
+                self.skipThreshold = self.scale_table[self.skipIndex]
+        
+    def update_scale_table(self, scale_table, force=False):
+        # Check if we need to update the gaussian conditional parameters, the
+        # offsets are only computed and stored when the conditonal model is
+        # updated.
+        if self._offset.numel() > 0 and not force:
+            return False
+        device = self.scale_table.device
+        self.scale_table = self._prepare_scale_table(scale_table).to(device)
+        self.skipThreshold = self.scale_table[self.skipIndex] if self.skipIndex >= 0 else -1
+        self.update()
+        return True
+    
+    def reset_scale_bound(self, scale_bound):
+        if scale_bound is None:
+            scale_bound = self.scale_table[0]
+        if scale_bound <= 0:
+            raise ValueError("Invalid parameters")
+        device = self.scale_bound.device
+        self.scale_bound = torch.tensor([float(scale_bound)]).to(device)
+        self.lower_bound_scale = LowerBound(self.scale_bound).to(device)
+
+    def _likelihood(
+        self, inputs: Tensor, scales: Tensor, means: Optional[Tensor] = None
+    ) -> Tensor:
+        half = float(0.5)
+
+        if means is not None:
+            values = inputs - means
+            # skip_pos = scales <= self.skipThreshold
+            # values[skip_pos] = 0
+            
+            # skip_values = values.clone()
+            # skip_values[skip_pos] = 0
+            # values = values + (skip_values - values).detach()
+        else:
+            values = inputs
+
+        scales = self.lower_bound_scale(scales)
+
+        values = torch.abs(values)
+        upper = self._standardized_cumulative((half - values) / scales)
+        lower = self._standardized_cumulative((-half - values) / scales)
+        likelihood = upper - lower
+        
+        skip_pos = scales <= self.skipThreshold
+        likelihood = ~skip_pos * likelihood + skip_pos * torch.ones_like(likelihood)
+        # skip_likelihood = likelihood.clone()
+        # skip_likelihood[skip_pos] = 1
+        # # likelihood = skip_likelihood
+        # # likelihood = likelihood + (skip_likelihood - likelihood).detach()
+        # skip_likelihood.detach_()
+        # likelihood[skip_pos] = skip_likelihood[skip_pos]
+
+        # return likelihood[~skip_pos]
+        return likelihood
+
+    def quantize(
+        self, inputs: Tensor, mode: str, means: Optional[Tensor] = None, scales = None
+    ) -> Tensor:
+        if mode not in ("noise", "dequantize", "symbols"):
+            raise ValueError(f'Invalid quantization mode: "{mode}"')
+
+        if mode == "noise":
+            half = float(0.5)
+            noise = torch.empty_like(inputs).uniform_(-half, half)
+            inputs = inputs + noise
+            return inputs
+
+        outputs = inputs.clone()
+        if means is not None:
+            skip_pos = scales <= self.skipThreshold
+            outputs -= means
+            outputs[skip_pos] = 0
+
+        outputs = torch.round(outputs)
+
+        if mode == "dequantize":
+            if means is not None:
+                outputs += means
+            return outputs
+
+        assert mode == "symbols", mode
+        outputs = outputs.int()
+        return outputs
+
+    def compress_quantize(
+        self, inputs: Tensor, mode: str, means: Optional[Tensor] = None, skip_pos = None
+    ) -> Tensor:
+        if mode not in ("noise", "dequantize", "symbols"):
+            raise ValueError(f'Invalid quantization mode: "{mode}"')
+
+        outputs = inputs.clone()
+        if means is not None:
+            outputs -= means
+            outputs[skip_pos] = 0
+
+        outputs = torch.round(outputs)
+
+        if mode == "dequantize":
+            if means is not None:
+                outputs += means
+            return outputs
+
+        assert mode == "symbols", mode
+        outputs = outputs.int()
+        return outputs
+
+    def compress(self, inputs, indexes, means=None):
+        """
+        Compress input tensors to char strings.
+
+        Args:
+            inputs (torch.Tensor): input tensors
+            indexes (torch.IntTensor): tensors CDF indexes
+            means (torch.Tensor, optional): optional tensor means
+        """
+        skip_pos = indexes <= self.skipIndex
+        symbols = self.compress_quantize(inputs, "symbols", means, skip_pos=skip_pos)
+
+        if len(inputs.size()) < 2:
+            raise ValueError(
+                "Invalid `inputs` size. Expected a tensor with at least 2 dimensions."
+            )
+
+        if inputs.size() != indexes.size():
+            raise ValueError("`inputs` and `indexes` should have the same size.")
+
+        self._check_cdf_size()
+        self._check_cdf_length()
+        self._check_offsets_size()
+
+        strings = []
+        for i in range(symbols.size(0)):
+            rv = self.entropy_coder.encode_with_indexes(
+                symbols[i][~skip_pos[i]].reshape(-1).int().tolist(),
+                indexes[i][~skip_pos[i]].reshape(-1).int().tolist(),
+                self._quantized_cdf.tolist(),
+                self._cdf_length.reshape(-1).int().tolist(),
+                self._offset.reshape(-1).int().tolist(),
+            )
+            strings.append(rv)
+        return strings
+
+    def decompress(
+        self,
+        strings: str,
+        indexes: torch.IntTensor,
+        dtype: torch.dtype = torch.float,
+        means: torch.Tensor = None,
+    ):
+        """
+        Decompress char strings to tensors.
+
+        Args:
+            strings (str): compressed tensors
+            indexes (torch.IntTensor): tensors CDF indexes
+            dtype (torch.dtype): type of dequantized output
+            means (torch.Tensor, optional): optional tensor means
+        """
+
+        if not isinstance(strings, (tuple, list)):
+            raise ValueError("Invalid `strings` parameter type.")
+
+        if not len(strings) == indexes.size(0):
+            raise ValueError("Invalid strings or indexes parameters")
+
+        if len(indexes.size()) < 2:
+            raise ValueError(
+                "Invalid `indexes` size. Expected a tensor with at least 2 dimensions."
+            )
+
+        skip_pos = indexes <= self.skipIndex
+        self._check_cdf_size()
+        self._check_cdf_length()
+        self._check_offsets_size()
+
+        if means is not None:
+            if means.size()[:2] != indexes.size()[:2]:
+                raise ValueError("Invalid means or indexes parameters")
+            if means.size() != indexes.size():
+                for i in range(2, len(indexes.size())):
+                    if means.size(i) != 1:
+                        raise ValueError("Invalid means parameters")
+
+        cdf = self._quantized_cdf
+        outputs = cdf.new_empty(indexes.size())
+
+        for i, s in enumerate(strings):
+            values = self.entropy_coder.decode_with_indexes(
+                s,
+                indexes[i][~skip_pos[i]].reshape(-1).int().tolist(),
+                cdf.tolist(),
+                self._cdf_length.reshape(-1).int().tolist(),
+                self._offset.reshape(-1).int().tolist(),
+            )
+            outputs[i].fill_(0)
+            
+            values = torch.tensor(
+                values, device=outputs.device, dtype=outputs.dtype
+            )
+            outputs[i][~skip_pos[i]] = values
+
+        outputs = self.dequantize(outputs, means, dtype)
+        return outputs
+
+    def forward(
+        self,
+        inputs: Tensor,
+        scales: Tensor = None,
+        means: Optional[Tensor] = None,
+        training: Optional[bool] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        if training is None:
+            training = self.training
+        # outputs = inputs.clone()
+        outputs = self.quantize(inputs, "noise" if training else "dequantize", means, scales=scales)
+        likelihood = self._likelihood(outputs, scales, means)
+        if self.use_likelihood_bound:
+            likelihood = self.likelihood_lower_bound(likelihood)
+        return outputs, likelihood

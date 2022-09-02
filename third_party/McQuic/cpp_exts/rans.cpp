@@ -14,8 +14,8 @@ PYBIND11_MODULE(rans, m) {
   m.doc() = R"(range Asymmetric Numeral System (rANS) python bindings.
 
 Exports:
-    RansEncoder: Encode list of symbols to string.
-    RansDecoder: Decode a string to a list of symbols.
+    RansEncoderMcQuic: Encode list of symbols to string.
+    RansDecoderMcQuic: Decode a string to a list of symbols.
     pmfToQuantizedCDF: Return quantized CDF for a given PMF.)";
 
   init_ops(m);

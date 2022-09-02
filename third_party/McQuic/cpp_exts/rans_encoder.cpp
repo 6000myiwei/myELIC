@@ -47,7 +47,7 @@ namespace py = pybind11;
 
 
 py::bytes
-RansEncoder::encodeWithIndexes(const std::vector<int32_t> &symbols,
+RansEncoderMcQuic::encodeWithIndexes(const std::vector<int32_t> &symbols,
                                  const std::vector<int32_t> &indexes,
                                  const std::vector<std::vector<int32_t>> &cdfs,
                                  const std::vector<int32_t> &cdfs_sizes,
@@ -62,9 +62,9 @@ RansEncoder::encodeWithIndexes(const std::vector<int32_t> &symbols,
 
 void init_encoders(py::module_ &m) {
 
-  py::class_<RansEncoder>(m, "RansEncoder", "Encoder to encode list of symbols to string. This class exports only one method `encodeWithIndexes(...)`.")
+  py::class_<RansEncoderMcQuic>(m, "RansEncoderMcQuic", "Encoder to encode list of symbols to string. This class exports only one method `encodeWithIndexes(...)`.")
       .def(py::init<>())
-      .def("encodeWithIndexes", &RansEncoder::encodeWithIndexes, R"(Encode list of symbols to string.
+      .def("encodeWithIndexes", &RansEncoderMcQuic::encodeWithIndexes, R"(Encode list of symbols to string.
 
 This method accepts symbols under mixed distributions. Therefore, symbol from different distribution can be encoded by its corresponding CDF to achieve the best rate.
 

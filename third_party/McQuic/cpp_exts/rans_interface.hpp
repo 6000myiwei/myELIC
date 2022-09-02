@@ -74,14 +74,14 @@ private:
   std::vector<RansSymbol> _syms;
 };
 
-class RansEncoder {
+class RansEncoderMcQuic {
 public:
-  RansEncoder() = default;
+  RansEncoderMcQuic() = default;
 
-  RansEncoder(const RansEncoder &) = delete;
-  RansEncoder(RansEncoder &&) = delete;
-  RansEncoder &operator=(const RansEncoder &) = delete;
-  RansEncoder &operator=(RansEncoder &&) = delete;
+  RansEncoderMcQuic(const RansEncoderMcQuic &) = delete;
+  RansEncoderMcQuic(RansEncoderMcQuic &&) = delete;
+  RansEncoderMcQuic &operator=(const RansEncoderMcQuic &) = delete;
+  RansEncoderMcQuic &operator=(RansEncoderMcQuic &&) = delete;
 
   py::bytes encodeWithIndexes(const std::vector<int32_t> &symbols,
                                 const std::vector<int32_t> &indexes,
@@ -90,14 +90,14 @@ public:
                                 const std::vector<int32_t> &offsets);
 };
 
-class RansDecoder {
+class RansDecoderMcQuic {
 public:
-  RansDecoder() = default;
+  RansDecoderMcQuic() = default;
 
-  RansDecoder(const RansDecoder &) = delete;
-  RansDecoder(RansDecoder &&) = delete;
-  RansDecoder &operator=(const RansDecoder &) = delete;
-  RansDecoder &operator=(RansDecoder &&) = delete;
+  RansDecoderMcQuic(const RansDecoderMcQuic &) = delete;
+  RansDecoderMcQuic(RansDecoderMcQuic &&) = delete;
+  RansDecoderMcQuic &operator=(const RansDecoderMcQuic &) = delete;
+  RansDecoderMcQuic &operator=(RansDecoderMcQuic &&) = delete;
 
   std::vector<int32_t>
   decodeWithIndexes(const std::string &encoded,

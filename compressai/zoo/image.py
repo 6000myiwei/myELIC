@@ -37,7 +37,10 @@ from compressai.models import (
     MeanScaleHyperprior,
     ScaleHyperprior,
     TinyLIC,
-    ELIC
+    ELIC,
+    ELIC_VQ,
+    ELIC_ADA
+
 )
 
 from .pretrained import load_pretrained
@@ -50,7 +53,9 @@ __all__ = [
     "cheng2020_anchor",
     "cheng2020_attn",
     "tinylic",
-    "elic"
+    "elic",
+    "elic_vq",
+    "elic_ada"
 ]
 
 model_architectures = {
@@ -62,6 +67,8 @@ model_architectures = {
     "cheng2020-attn": Cheng2020Attention,
     "tinylic": TinyLIC,
     "elic" : ELIC,
+    "elic_vq": ELIC_VQ,
+    "elic_ada": ELIC_ADA
 }
 
 root_url = "https://compressai.s3.amazonaws.com/models/v1"
@@ -269,6 +276,26 @@ cfgs = {
         7: (192, 320),
         8: (192, 320),
     },
+    "elic_vq":{
+        1: (128, 192),
+        2: (128, 192),
+        3: (128, 192),
+        4: (128, 192),
+        5: (128, 192),
+        6: (128, 192),
+        7: (128, 192),
+        8: (128, 192),
+    },
+    "elic_ada":{
+        1: (192, 320),
+        2: (192, 320),
+        3: (192, 320),
+        4: (192, 320),
+        5: (192, 320),
+        6: (192, 320),
+        7: (192, 320),
+        8: (192, 320),
+    }
 }
 
 
@@ -463,3 +490,21 @@ def elic(quality, metric="mse", pretrained=False, progress=True, **kwargs):
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
 
     return _load_model("elic", metric, quality, pretrained, progress, **kwargs)
+
+def elic_vq(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 8:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
+
+    return _load_model("elic_vq", metric, quality, pretrained, progress, **kwargs)
+
+def elic_ada(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 8:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
+
+    return _load_model("elic_ada", metric, quality, pretrained, progress, **kwargs)

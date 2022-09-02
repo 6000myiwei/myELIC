@@ -49,12 +49,30 @@ from compressai.datasets import ImageFolder
 from compressai.models.elic import CodecStageEnum, SCALE_BOUND
 from compressai.zoo import image_models
 
+from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
 
-# training_stage = [0, 20, 240]
-# double_lambda_trick_epoch = [0, 240]
 
-training_stage = [9999, 0, 40]
-double_lambda_trick_epoch = [0, 40]
+# training_stage = [9999, 220, 240]
+# double_lambda_trick_epoch = 240
+
+training_stage = [9999, 0, 0]
+double_lambda_trick_epoch = [0, 0]
+
+
+class DistortionLoss(nn.Module):
+    def __init__(self, lmbda=1e-2):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["mse_loss"] = self.mse(output["x_hat"], target)
+        out["loss"] = out["mse_loss"]
+
+        return out
 
 
 class RateDistortionLoss(nn.Module):
@@ -68,43 +86,12 @@ class RateDistortionLoss(nn.Module):
     def forward(self, output, target):
         N, _, H, W = target.size()
         out = {}
-        num_pixels = N * H * W
 
-        # y_bpp = (torch.log(output["likelihoods"]["y"])* ~output["skip_pos"]).sum() / (-math.log(2) * num_pixels)
-        # z_bpp = (torch.log(output["likelihoods"]["z"])).sum() / (-math.log(2) * num_pixels)
-        # out["bpp_loss"] = y_bpp + z_bpp
-        
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
+        out["bpp_loss"] = output["likelihoods"]["y"]
         out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
+        out["loss"] = out["mse_loss"] + out["bpp_loss"]
 
         return out
-
-class RateDistortionLossTwoPath(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
-
-    def __init__(self, lmbda=1e-2):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-    
-    def forward(self, output, target):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
-        weight = [0.5, 0.5, 1]
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)) * w
-            for likelihoods, w in zip(output["likelihoods"].values(), weight)
-        )
-        out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
-
-        return out
-
 
 
 class AverageMeter:
@@ -162,9 +149,9 @@ def configure_optimizers(net, args):
     
     opt_cls = optim.Adam
     try:
-        from apex.optimizers import FusedAdam
-        logging.info('using apex FusedAdam')
-        opt_cls = FusedAdam
+        from apex.optimizers import FusedLAMB
+        logging.info('using apex FusedLAMB')
+        opt_cls = FusedLAMB
     except ImportError:
         logging.info('cannot load apex FusedAdam, using default Pytorch implementation')
     parameters = {
@@ -172,36 +159,19 @@ def configure_optimizers(net, args):
         for n, p in net.named_parameters()
         if not n.endswith(".quantiles") and p.requires_grad
     }
-    aux_parameters = {
-        n
-        for n, p in net.named_parameters()
-        if n.endswith(".quantiles") and p.requires_grad
-    }
 
-    # Make sure we don't have an intersection of parameters
     params_dict = dict(net.named_parameters())
-    inter_params = parameters & aux_parameters
-    union_params = parameters | aux_parameters
-
-    assert len(inter_params) == 0
-    # if len(union_params) - len(params_dict.keys()) != 0 and "mod" in list(params_dict.keys() - union_params)[0]:
-    #     assert len(union_params) - len(params_dict.keys()) <= -1
-    # else:
-    #     assert len(union_params) - len(params_dict.keys()) == 0
 
     optimizer = opt_cls(
         (params_dict[n] for n in sorted(parameters)),
         lr=args.learning_rate,
     )
-    aux_optimizer = opt_cls(
-        (params_dict[n] for n in sorted(aux_parameters)),
-        lr=args.aux_learning_rate,
-    )
-    return optimizer, aux_optimizer
+
+    return optimizer
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
+    model, criterion, train_dataloader, optimizer, epoch, clip_max_norm
 ):
     model.train()
     device = next(model.parameters()).device
@@ -210,7 +180,6 @@ def train_one_epoch(
         d = d.to(device)
 
         optimizer.zero_grad()
-        aux_optimizer.zero_grad()
         
         ##TODO input training stage to the model
         out_net = model(d)
@@ -221,9 +190,6 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
-        aux_loss = model.aux_loss()
-        aux_loss.backward()
-        aux_optimizer.step()
 
         if i*len(d) % 2000 == 0:
             logging.info(
@@ -234,9 +200,6 @@ def train_one_epoch(
                 f'MSE loss: {out_criterion["mse_loss"].item():.5f} | '
                 f'PSNR: {10 * torch.log10(1 / out_criterion["mse_loss"]).item():.3f} |'
                 f'Bpp loss: {out_criterion["bpp_loss"].item():.4f} | '
-                f"Aux loss: {aux_loss.item():.2f}"
-                # ## ada mask log
-                f"| MASK avr: {out_net['mask'].mean().item():.4f}"
             )
 
 
@@ -247,7 +210,6 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     loss = AverageMeter()
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
-    aux_loss = AverageMeter()
 
     with torch.no_grad():
         for d in test_dataloader:
@@ -255,7 +217,6 @@ def test_epoch(epoch, test_dataloader, model, criterion):
             out_net = model(d)
             out_criterion = criterion(out_net, d)
 
-            aux_loss.update(model.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
@@ -266,7 +227,6 @@ def test_epoch(epoch, test_dataloader, model, criterion):
         f"MSE loss: {mse_loss.avg:.5f} | "
         f"PSNR: {10 * torch.log10(1 / mse_loss.avg).item():.3f} | "
         f"Bpp loss: {bpp_loss.avg:.4f} | "
-        f"Aux loss: {aux_loss.avg:.2f}\n"
     )
 
     return loss.avg
@@ -433,17 +393,17 @@ def main(argv):
     if device == "cuda":
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
-    net = image_models[args.model](quality=int(args.quality_level), stage=CodecStageEnum.TRAIN)
+    net = image_models[args.model](quality=int(args.quality_level))
     net = net.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
         net = CustomDataParallel(net)
 
-    optimizer, aux_optimizer = configure_optimizers(net, args)
+    optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[training_stage[-1]], gamma=0.1)
-    lr_scheduler_aux = optim.lr_scheduler.MultiStepLR(aux_optimizer, milestones=[training_stage[-1]], gamma=0.1)
-
+    # lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[training_stage[-1]], gamma=0.1)
+    lr_scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=16, warmup_steps=1, gamma=0.9)
+    
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
         logging.info("Loading "+str(args.checkpoint))
@@ -458,63 +418,51 @@ def main(argv):
     if args.optimizer:
         logging.info("Loading optimizer")
         last_epoch = checkpoint["epoch"] + 1
-        
-        # checkpoint["optimizer"]['param_groups'][0]['lr'] = args.learning_rate
-        # checkpoint["aux_optimizer"]['param_groups'][0]['lr'] = args.aux_learning_rate
-        
         optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-        
-        ## Temp Hack lr scheduler
-        # del checkpoint['lr_scheduler']['milestones']
-        # checkpoint['lr_scheduler']['_last_lr'] = args.learning_rate
-        
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
         
         # checkpoint['lr_scheduler']['base_lrs'] = args.aux_learning_rate
         # checkpoint['lr_scheduler']['_last_lr'] = args.aux_learning_rate
-        
-        # TODO add aux lr scheduler loader
-        lr_scheduler_aux.load_state_dict(checkpoint["lr_scheduler"])
     
     lmbda_value = double_lambda_value if last_epoch >= double_lambda_trick_epoch[0] and last_epoch < double_lambda_trick_epoch[1] else args.lmbda
-    criterion = RateDistortionLossTwoPath(lmbda=lmbda_value)
+    criterion = RateDistortionLoss(lmbda=lmbda_value)
     
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
         logging.info('======Current epoch %s ======'%epoch)
         logging.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        logging.info(f"Aux Learning rate: {aux_optimizer.param_groups[0]['lr']}")
-        if epoch >= training_stage[0] and epoch < training_stage[1]:
-            criterion = RateDistortionLoss(lmbda=lmbda_value)
-            net.stage =  CodecStageEnum.TRAIN_ONEPATH
-            logging.info("Training One Path")
-            
-        elif epoch >= training_stage[1]:
-            criterion = RateDistortionLoss(lmbda=lmbda_value)
-            net.stage = CodecStageEnum.TRAIN2
-            logging.info("Training stage 2")
-        
-        if epoch >= double_lambda_trick_epoch[0] and epoch < double_lambda_trick_epoch[1]:
-            lmbda_value = double_lambda_value
-            criterion.lmbda = lmbda_value
-        else:
-            lmbda_value = args.lmbda
-            criterion.lmbda = lmbda_value
         logging.info(f"using lambda: {lmbda_value}")
+        
+        if epoch % 3 == 0:
+            propotion = net.refresh()
+            logging.info(f"refresh propotion{[p.item for p in propotion]}")
+        # if epoch >= training_stage[0] and epoch < training_stage[1]:
+        #     criterion = RateDistortionLoss(lmbda=lmbda_value)
+        #     net.stage =  CodecStageEnum.TRAIN_ONEPATH
+        #     logging.info("Training One Path")
+            
+        # elif epoch >= training_stage[1]:
+        #     criterion = RateDistortionLoss(lmbda=lmbda_value)
+        #     net.stage = CodecStageEnum.TRAIN2
+        #     logging.info("Training stage 2")
+        
+        # if epoch >= double_lambda_trick_epoch[0] and epoch < double_lambda_trick_epoch[1]:
+        #     lmbda_value = double_lambda_value
+        #     criterion.lmbda = lmbda_value
+        # else:
+        #     lmbda_value = args.lmbda
+        #     criterion.lmbda = lmbda_value
         
         train_one_epoch(
             net,
             criterion,
             train_dataloader,
             optimizer,
-            aux_optimizer,
             epoch,
             args.clip_max_norm,
         )
         loss = test_epoch(epoch, test_dataloader, net, criterion)
         lr_scheduler.step()
-        lr_scheduler_aux.step()
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
@@ -526,9 +474,7 @@ def main(argv):
                     "state_dict": net.state_dict(),
                     "loss": loss,
                     "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
-                    "lr_scheduler_aux" : lr_scheduler_aux.state_dict()
                 },
                 is_best,
                 base_dir,

@@ -33,7 +33,7 @@ class CodecStageEnum(Enum):
 
 
 class YEncoder(nn.Module):
-    def __init__(self, in_channels=3, N=192, M=320, num_rsb=3) -> None:
+    def __init__(self, in_channels=3, N=192, M=256, num_rsb=3) -> None:
         super().__init__()
         self.g_a = nn.Sequential(
             conv(in_channels, N, 5, 2),
@@ -52,7 +52,7 @@ class YEncoder(nn.Module):
 
 
 class YDecoder(nn.Module):
-    def __init__(self, in_channels=3, N=192, M=320, num_rsb=3) -> None:
+    def __init__(self, in_channels=3, N=192, M=256, num_rsb=3) -> None:
         super().__init__()
         self.g_s = nn.Sequential(
             AttentionBlock(M),
@@ -70,7 +70,7 @@ class YDecoder(nn.Module):
         return self.g_s(x)
     
 class ZEncoder(nn.Module):
-    def __init__(self, N=192, M=320) -> None:
+    def __init__(self, N=192, M=256) -> None:
         super().__init__()
         self.h_a = nn.Sequential(
             conv(M, N, stride=1, kernel_size=3),
@@ -84,7 +84,7 @@ class ZEncoder(nn.Module):
         return self.h_a(x)
 
 class ZDecoder(nn.Module):
-    def __init__(self, N=192, M=320) -> None:
+    def __init__(self, N=192, M=256) -> None:
         super().__init__()
         self.h_s = nn.Sequential(
             deconv(N, M, stride=2, kernel_size=5),
@@ -236,7 +236,7 @@ class ContextIterator(nn.Module):
     
     inner_param_cls = ChannelARParamTransform
     
-    def __init__(self, k_size=5, groups=[16,16,32,64,None]) -> None:
+    def __init__(self, k_size=5, groups=[16,16,32,64,None], levels=3) -> None:
         super().__init__()
         assert groups[-1] is not None
         self.groups = groups
@@ -349,20 +349,11 @@ def ParamGroupTwoPath(ParamList):
     return {1:(mu1, sigma1), 2:(mu2, sigma2)}
 
 
-def add_sn(m):
-    for name, layer in m.named_children():
-        m.add_module(name, add_sn(layer))
-    if isinstance(m, (nn.Conv2d, nn.Linear)):
-        return nn.utils.spectral_norm(m)
-    else:
-        return m
-
-class ELIC(nn.Module):
-    def __init__(self, N=192, M=320, stage=CodecStageEnum.TRAIN, skipIndex=SKIP_INDEX) -> None:
+class ELIC_HIE(nn.Module):
+    def __init__(self, N=192, M=256, stage=CodecStageEnum.TRAIN, skipIndex=SKIP_INDEX) -> None:
         super().__init__()
-        self.groups = [16,16,32,64,None]
-        self.groups[-1] = M - sum(self.groups[:-1])
-        self.n_groups = len(self.groups)
+        self.groups = [16,16,16,16,64,64,64]
+        self.n_groups = 3
         
         self.g_a = YEncoder(N=N, M=M)
         self.h_a = ZEncoder(N=N, M=M)
@@ -376,8 +367,6 @@ class ELIC(nn.Module):
         self.contextiter = ContextIterator(groups=self.groups)
         self.y_parameter = SpaceAndChannleParamIterater(hyper_channels=M * 2, groups=self.groups)
         
-        self.gate_model = CheckerboardSliceAlignMux()
-        
         self.noise_quant = Quantizator_RT()
         # self.ste_quant = STEQuant()
         self.ste_quant = STEQuantWithSkip(skipThreshold=get_scale_table()[skipIndex])
@@ -386,8 +375,6 @@ class ELIC(nn.Module):
         
         self.Mux = CheckerboardMux
         self.Demux = CheckerboardDemux
-        # add_sn(self.g_a)
-        # add_sn(self.h_a)
         
 
     @classmethod
@@ -669,7 +656,6 @@ class ELIC(nn.Module):
             
             # print(sum(anchor_div_non_anchor) / len(anchor_div_non_anchor))
             print(sum(diff))
-            
             return {
                 "strings": [*y_string_list, z_strings],
                 "shape": z.size()[-2:],
@@ -766,7 +752,6 @@ if __name__ == "__main__":
 
     # x = torch.rand((1,3,768,512)).cuda()
     img = Image.open('/hdd/zyw/ImageDataset/kodak/kodim01.png').convert("RGB")
-    # img = Image.open('/home/zyw/original.jpg').convert("RGB")
     x = ToTensor()(img).cuda()
     x = x.unsqueeze(0)
     
@@ -774,7 +759,7 @@ if __name__ == "__main__":
     net.eval()
     net.stage = CodecStageEnum.Check
     
-    checkpoint = torch.load('pretrained/elic/6/skip_best.pth.tar')
+    checkpoint = torch.load('pretrained/elic/6/1.pth.tar')
     net.load_state_dict(checkpoint['state_dict'])
     
     net.update(force=True)
@@ -797,8 +782,6 @@ if __name__ == "__main__":
 
     print(total_bytes * 8 / 768 / 512)
     print((y1 == y2).all())
-
-    x_hat = rec['x_hat']
     
     # # 速度测试
     # import time

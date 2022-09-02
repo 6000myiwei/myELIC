@@ -102,7 +102,7 @@ inline uint32_t Rans64DecGetBits(Rans64State *r, uint32_t **pptr,
 }
 
 std::vector<int32_t>
-RansDecoder::decodeWithIndexes(const std::string &encoded,
+RansDecoderMcQuic::decodeWithIndexes(const std::string &encoded,
                                  const std::vector<int32_t> &indexes,
                                  const std::vector<std::vector<int32_t>> &cdfs,
                                  const std::vector<int32_t> &cdfs_sizes,
@@ -172,7 +172,7 @@ RansDecoder::decodeWithIndexes(const std::string &encoded,
   return output;
 }
 
-void RansDecoder::set_stream(const std::string &encoded) {
+void RansDecoderMcQuic::set_stream(const std::string &encoded) {
   _stream = encoded;
   uint32_t *ptr = (uint32_t *)_stream.data();
   assert(ptr != nullptr);
@@ -181,7 +181,7 @@ void RansDecoder::set_stream(const std::string &encoded) {
 }
 
 std::vector<int32_t>
-RansDecoder::decode_stream(const std::vector<int32_t> &indexes,
+RansDecoderMcQuic::decode_stream(const std::vector<int32_t> &indexes,
                            const std::vector<std::vector<int32_t>> &cdfs,
                            const std::vector<int32_t> &cdfs_sizes,
                            const std::vector<int32_t> &offsets) {
@@ -249,11 +249,11 @@ RansDecoder::decode_stream(const std::vector<int32_t> &indexes,
 
 
 void init_decoders(py::module_ &m) {
-  py::class_<RansDecoder>(m, "RansDecoder", "Decoder to decode a string to a list of symbols. This class exports only one method `decodeWithIndexes(...)`.")
+  py::class_<RansDecoderMcQuic>(m, "RansDecoderMcQuic", "Decoder to decode a string to a list of symbols. This class exports only one method `decodeWithIndexes(...)`.")
       .def(py::init<>())
-      .def("decodeWithIndexes", &RansDecoder::decodeWithIndexes, R"(Decode a string to a list of symbols.
+      .def("decodeWithIndexes", &RansDecoderMcQuic::decodeWithIndexes, R"(Decode a string to a list of symbols.
 
-This method is inverse operation of `RansEncoder.encodeWithIndexes(...)`. All args are same.
+This method is inverse operation of `RansEncoderMcQuic.encodeWithIndexes(...)`. All args are same.
 
 Args:
     encoded (bytes): Encoded byte string.

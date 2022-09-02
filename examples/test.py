@@ -20,11 +20,11 @@ dataset_path = '/hdd/zyw/ImageDataset'
 # checkpoint_path = './pretrained/elic/8/lambda0.9.pth.tar'
 # checkpoint_path = './pretrained/elic/8/lambda0.16.pth.tar'
 # checkpoint_path = './pretrained/elic/7/checkpoint_best_loss.pth.tar'
-checkpoint_path = './pretrained/elic/4/checkpoint.pth.tar'
+checkpoint_path = './pretrained/elic/6/checkpoint.pth.tar'
 quality_level = 8
 stage = CodecStageEnum.TRAIN2
 
-lambda_value = 0.045
+lambda_value = 0.0225
 
 def setup_logger():
     log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
@@ -125,7 +125,7 @@ net = net.to(device)
 
 logging.info("Loading "+str(checkpoint_path))
 checkpoint = torch.load(checkpoint_path, map_location=device)
-net.load_state_dict(checkpoint["state_dict"], strict=False)
+net.load_state_dict(checkpoint["state_dict"], strict=True)
 
 
 logging.info("begin Testing")

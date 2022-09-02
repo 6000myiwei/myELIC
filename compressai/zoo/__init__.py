@@ -36,6 +36,8 @@ from .image import (
     mbt2018_mean,
     tinylic,
     elic,
+    elic_vq,
+    elic_ada
 )
 from .pretrained import load_pretrained as load_state_dict
 from .video import ssf2020
@@ -49,6 +51,8 @@ image_models = {
     "cheng2020-attn": cheng2020_attn,
     "tinylic": tinylic,
     'elic': elic,
+    'elic_vq':elic_vq,
+    'elic_ada':elic_ada
 }
 
 video_models = {

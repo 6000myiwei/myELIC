@@ -123,8 +123,11 @@ def inference(model, x):
 
     num_pixels = x.size(0) * x.size(2) * x.size(3)
     bpp = sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+    lmbda = 0.045
+    loss = bpp + lmbda * 255**2 * F.mse_loss(x, out_dec["x_hat"]).item()
 
     return {
+        "loss" : loss,
         "psnr": psnr(x, out_dec["x_hat"]),
         "ms-ssim": ms_ssim(x, out_dec["x_hat"], data_range=1.0).item(),
         "bpp": bpp,
