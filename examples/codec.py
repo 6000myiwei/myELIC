@@ -48,6 +48,7 @@ from torchvision.transforms import ToPILImage, ToTensor
 import compressai
 
 from compressai.datasets import RawVideoSequence, VideoFormat
+from compressai.models.elic import CodecStageEnum
 from compressai.transforms.functional import (
     rgb2ycbcr,
     ycbcr2rgb,
@@ -64,6 +65,7 @@ metric_ids = {"mse": 0, "ms-ssim": 1}
 
 Frame = Union[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, ...]]
 
+MAX_PIXELS = 3840*2160
 
 class CodecType(Enum):
     IMAGE_CODEC = 0
@@ -280,27 +282,54 @@ def encode_image(input, codec: CodecInfo, output):
         x = convert_yuv420_rgb(org_seq[0], codec.device, max_val)
     else:
         img = load_image(input)
-        x = img2torch(img)
+        x = img2torch(img).to(codec.device)
         bitdepth = 8
 
     h, w = x.size(2), x.size(3)
-    p = 64  # maximum 6 strides of 2
-    x = pad(x, p)
+    if h * w <= MAX_PIXELS:
+        p = 64  # maximum 6 strides of 2
+        x = pad(x, p)
 
-    with torch.no_grad():
-        out = codec.net.compress(x)
+        with torch.no_grad():
+            out = codec.net.compress(x)
 
-    shape = out["shape"]
+        shape = out["shape"]
 
-    with Path(output).open("wb") as f:
-        write_uchars(f, codec.codec_header)
-        # write original image size
-        write_uints(f, (h, w))
-        # write original bitdepth
-        write_uchars(f, (bitdepth,))
-        # write shape and number of encoded latents
-        write_body(f, shape, out["strings"])
+        with Path(output).open("wb") as f:
+            write_uchars(f, codec.codec_header)
+            ## TODO: temporary add parts option, can be removed in large memory GPU
+            write_uchars(f,(1,))
+            # write original bitdepth
+            write_uchars(f, (bitdepth,))
+            # write original image size
+            write_uints(f, (h, w))
+            # write shape and number of encoded latents
+            write_body(f, shape, out["strings"])
 
+    else:
+        parts = h * w // MAX_PIXELS + 1
+        # along H dim chunk
+        xs = torch.chunk(x, parts, 2)
+        with Path(output).open("wb") as f:
+            write_uchars(f, codec.codec_header)
+            write_uchars(f, (parts,))
+            write_uchars(f, (bitdepth,))
+            for patch in xs:
+                hp, wp = patch.size(2), patch.size(3)
+                p = 64  # maximum 6 strides of 2
+                x = pad(patch, p)
+
+                with torch.no_grad():
+                    out = codec.net.compress(x)
+
+                shape = out["shape"]
+                
+                # write original image size
+                write_uints(f, (hp, wp))
+                # write original bitdepth
+                # write shape and number of encoded latents
+                write_body(f, shape, out["strings"])            
+        
     size = filesize(output)
     bpp = float(size) * 8 / (h * w)
 
@@ -405,24 +434,65 @@ def _encode(input, num_of_frames, model, metric, quality, coder, device, output)
     )
 
 
+def _encode_checkpoint(input, num_of_frames, model, metric, quality, ckpt_path, coder, device, output):
+    encode_func = {
+        CodecType.IMAGE_CODEC: encode_image,
+        CodecType.VIDEO_CODEC: encode_video,
+    }
+
+    compressai.set_entropy_coder(coder)
+    enc_start = time.time()
+
+    start = time.time()
+    model_info = models[model]
+    net = model_info(quality=quality, metric=metric, pretrained=False).to(device).eval()
+    
+    checkpoint = torch.load(ckpt_path)
+    net.load_state_dict(checkpoint['state_dict'])
+
+    net.update(force=True)
+    net.stage = CodecStageEnum.TEST
+    
+    codec_type = (
+        CodecType.IMAGE_CODEC if model in image_models else CodecType.VIDEO_CODEC
+    )
+    
+    codec_header_info = get_header(model, metric, quality, num_of_frames, codec_type)
+    load_time = time.time() - start
+
+    if not Path(input).is_file():
+        raise FileNotFoundError(f"{input} does not exist")
+
+    codec_info = CodecInfo(codec_header_info, None, None, net, device)
+    out = encode_func[codec_type](input, codec_info, output)
+
+    enc_time = time.time() - enc_start
+
+    print(
+        f"{out['bpp']:.3f} bpp |"
+        f" Encoded in {enc_time:.2f}s (model loading: {load_time:.2f}s)"
+    )
+
+
 def decode_image(f, codec: CodecInfo, output):
     strings, shape = read_body(f)
     with torch.no_grad():
         out = codec.net.decompress(strings, shape)
 
     x_hat = crop(out["x_hat"], codec.original_size)
+    return x_hat
 
-    img = torch2img(x_hat)
+    # img = torch2img(x_hat)
 
-    if output is not None:
-        if Path(output).suffix == ".yuv":
-            rec = convert_rgb_yuv420(x_hat)
-            with Path(output).open("wb") as fout:
-                write_frame(fout, rec, codec.original_bitdepth)
-        else:
-            img.save(output)
+    # if output is not None:
+    #     if Path(output).suffix == ".yuv":
+    #         rec = convert_rgb_yuv420(x_hat)
+    #         with Path(output).open("wb") as fout:
+    #             write_frame(fout, rec, codec.original_bitdepth)
+    #     else:
+    #         img.save(output)
 
-    return {"img": img}
+    # return {"img": img}
 
 
 def decode_video(f, codec: CodecInfo, output):
@@ -507,6 +577,73 @@ def _decode(inputpath, coder, show, device, output=None):
     if show:
         # For video, only the last frame is shown
         show_image(out["img"])
+
+
+def _decode_checkpoint(inputpath, coder, ckpt_path, show, device, output=None):
+    decode_func = {
+        CodecType.IMAGE_CODEC: decode_image,
+        CodecType.VIDEO_CODEC: decode_video,
+    }
+
+    compressai.set_entropy_coder(coder)
+
+    dec_start = time.time()
+    with Path(inputpath).open("rb") as f:
+        model, metric, quality = parse_header(read_uchars(f, 2))
+        
+        ## TODO: temporary add parts option, can be removed in large memory GPU
+        parts = read_uchars(f, 1)[0]
+        original_bitdepth = read_uchars(f, 1)[0]
+
+
+        start = time.time()
+        model_info = models[model]
+        net = (
+            model_info(quality=quality, metric=metric, pretrained=False)
+            .to(device)
+            .eval()
+        )
+        codec_type = (
+            CodecType.IMAGE_CODEC if model in image_models else CodecType.VIDEO_CODEC
+        )
+        checkpoint = torch.load(ckpt_path)
+        net.load_state_dict(checkpoint['state_dict'])
+
+        net.update(force=True)
+        net.stage = CodecStageEnum.TEST
+
+        load_time = time.time() - start
+        print(f"Model: {model:s}, metric: {metric:s}, quality: {quality:d}")
+
+        if parts == 1:
+            original_size = read_uints(f, 2)
+            stream_info = CodecInfo(None, original_size, original_bitdepth, net, device)
+            x_hat = decode_func[codec_type](f, stream_info, output)
+        else:
+            x_hat = []
+            for _ in range(parts):
+                original_size = read_uints(f, 2)
+                stream_info = CodecInfo(None, original_size, original_bitdepth, net, device)
+                x_hat.append(decode_func[codec_type](f, stream_info, output))
+                torch.cuda.empty_cache()
+            x_hat = torch.cat(x_hat, dim=2)
+        
+        img = torch2img(x_hat)
+        if output is not None:
+            if Path(output).suffix == ".yuv":
+                rec = convert_rgb_yuv420(x_hat)
+                with Path(output).open("wb") as fout:
+                    write_frame(fout, rec, stream_info.original_bitdepth)
+            else:
+                img.save(output)
+                
+    dec_time = time.time() - dec_start
+    print(f"Decoded in {dec_time:.2f}s (model loading: {load_time:.2f}s)")
+
+    if show:
+        # For video, only the last frame is shown
+        show_image(img)
+
 
 
 def show_image(img: Image.Image):
