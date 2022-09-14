@@ -61,9 +61,9 @@ def limbocodec():
     '''
 
 
-@app.route('/uploads/<name>')
+@app.route('/limbocodec/uploads/<name>')
 def download_file(name):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], name)
+    return send_file(os.path.join(app.config["UPLOAD_FOLDER"], 'outputs', name))
 
 
 app.add_url_rule(
@@ -126,7 +126,8 @@ def request_decode():
         except Exception as e:
             return "Decode Error: " + e.__repr__
         else:
-            return send_file(out_path)
+            return redirect(url_for('download_file', name=out_name))
+            # return send_file(out_path)
     else:
         return "Decode Error: Not allowed file."
 

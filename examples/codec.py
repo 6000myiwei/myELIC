@@ -635,7 +635,7 @@ def _decode_checkpoint(inputpath, coder, ckpt_path, show, device, output=None):
                 with Path(output).open("wb") as fout:
                     write_frame(fout, rec, stream_info.original_bitdepth)
             else:
-                img.save(output)
+                img.save(output, compress=9)
                 
     dec_time = time.time() - dec_start
     print(f"Decoded in {dec_time:.2f}s (model loading: {load_time:.2f}s)")
