@@ -32,6 +32,8 @@ from torch.hub import load_state_dict_from_url
 from compressai.models import (
     Cheng2020Anchor,
     Cheng2020Attention,
+    Cheng20Checkerboard,
+    Cheng20ADA,
     FactorizedPrior,
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
@@ -42,6 +44,7 @@ from compressai.models import (
     ELIC_ADA
 
 )
+from compressai.models.checkerboard import Minen18ADA, Minen18Checkerboard
 
 from .pretrained import load_pretrained
 
@@ -50,8 +53,12 @@ __all__ = [
     "bmshj2018_hyperprior",
     "mbt2018",
     "mbt2018_mean",
+    "minen18_checkerboard",
+    "minen18_ada"
     "cheng2020_anchor",
     "cheng2020_attn",
+    "cheng2020_checkerboard",
+    "cheng2020_ada"
     "tinylic",
     "elic",
     "elic_vq",
@@ -63,8 +70,12 @@ model_architectures = {
     "bmshj2018-hyperprior": ScaleHyperprior,
     "mbt2018-mean": MeanScaleHyperprior,
     "mbt2018": JointAutoregressiveHierarchicalPriors,
+    "minen18-checkerboard": Minen18Checkerboard,
+    "minen18-ada": Minen18ADA,
     "cheng2020-anchor": Cheng2020Anchor,
     "cheng2020-attn": Cheng2020Attention,
+    "cheng2020-checkerboard":Cheng20Checkerboard,
+    "cheng2020-ada":Cheng20ADA,
     "tinylic": TinyLIC,
     "elic" : ELIC,
     "elic_vq": ELIC_VQ,
@@ -240,6 +251,26 @@ cfgs = {
         7: (192, 320),
         8: (192, 320),
     },
+    "minen18-checkerboard": {
+        1: (192, 192),
+        2: (192, 192),
+        3: (192, 192),
+        4: (192, 192),
+        5: (192, 320),
+        6: (192, 320),
+        7: (192, 320),
+        8: (192, 320),
+    },  
+    "minen18-ada": {
+        1: (192, 192),
+        2: (192, 192),
+        3: (192, 192),
+        4: (192, 192),
+        5: (192, 320),
+        6: (192, 320),
+        7: (192, 320),
+        8: (192, 320),
+    },
     "cheng2020-anchor": {
         1: (128,),
         2: (128,),
@@ -249,6 +280,22 @@ cfgs = {
         6: (192,),
     },
     "cheng2020-attn": {
+        1: (128,),
+        2: (128,),
+        3: (128,),
+        4: (192,),
+        5: (192,),
+        6: (192,),
+    },
+    "cheng2020-checkerboard": {
+        1: (128,),
+        2: (128,),
+        3: (128,),
+        4: (192,),
+        5: (192,),
+        6: (192,),
+    },
+    "cheng2020-ada": {
         1: (128,),
         2: (128,),
         3: (128,),
@@ -418,6 +465,51 @@ def mbt2018(quality, metric="mse", pretrained=False, progress=True, **kwargs):
     return _load_model("mbt2018", metric, quality, pretrained, progress, **kwargs)
 
 
+def minen18_checkerboard(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    r"""Self-attention model variant from `"Learned Image Compression with
+    Discretized Gaussian Mixture Likelihoods and Attention Modules"
+    <https://arxiv.org/abs/2001.01568>`_, by Zhengxue Cheng, Heming Sun, Masaru
+    Takeuchi, Jiro Katto.
+
+    Args:
+        quality (int): Quality levels (1: lowest, highest: 6)
+        metric (str): Optimized metric, choose from ('mse', 'ms-ssim')
+        pretrained (bool): If True, returns a pre-trained model
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 6:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
+
+    return _load_model(
+        "minen18-checkerboard", metric, quality, pretrained, progress, **kwargs
+    )
+
+def minen18_ada(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    r"""Self-attention model variant from `"Learned Image Compression with
+    Discretized Gaussian Mixture Likelihoods and Attention Modules"
+    <https://arxiv.org/abs/2001.01568>`_, by Zhengxue Cheng, Heming Sun, Masaru
+    Takeuchi, Jiro Katto.
+
+    Args:
+        quality (int): Quality levels (1: lowest, highest: 6)
+        metric (str): Optimized metric, choose from ('mse', 'ms-ssim')
+        pretrained (bool): If True, returns a pre-trained model
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 6:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
+
+    return _load_model(
+        "minen18-ada", metric, quality, pretrained, progress, **kwargs
+    )
+
+
 def cheng2020_anchor(quality, metric="mse", pretrained=False, progress=True, **kwargs):
     r"""Anchor model variant from `"Learned Image Compression with
     Discretized Gaussian Mixture Likelihoods and Attention Modules"
@@ -461,6 +553,50 @@ def cheng2020_attn(quality, metric="mse", pretrained=False, progress=True, **kwa
 
     return _load_model(
         "cheng2020-attn", metric, quality, pretrained, progress, **kwargs
+    )
+
+def cheng2020_checkerboard(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    r"""Self-attention model variant from `"Learned Image Compression with
+    Discretized Gaussian Mixture Likelihoods and Attention Modules"
+    <https://arxiv.org/abs/2001.01568>`_, by Zhengxue Cheng, Heming Sun, Masaru
+    Takeuchi, Jiro Katto.
+
+    Args:
+        quality (int): Quality levels (1: lowest, highest: 6)
+        metric (str): Optimized metric, choose from ('mse', 'ms-ssim')
+        pretrained (bool): If True, returns a pre-trained model
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 6:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
+
+    return _load_model(
+        "cheng2020-checkerboard", metric, quality, pretrained, progress, **kwargs
+    )
+
+def cheng2020_ada(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+    r"""Self-attention model variant from `"Learned Image Compression with
+    Discretized Gaussian Mixture Likelihoods and Attention Modules"
+    <https://arxiv.org/abs/2001.01568>`_, by Zhengxue Cheng, Heming Sun, Masaru
+    Takeuchi, Jiro Katto.
+
+    Args:
+        quality (int): Quality levels (1: lowest, highest: 6)
+        metric (str): Optimized metric, choose from ('mse', 'ms-ssim')
+        pretrained (bool): If True, returns a pre-trained model
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    if metric not in ("mse", "ms-ssim"):
+        raise ValueError(f'Invalid metric "{metric}"')
+
+    if quality < 1 or quality > 6:
+        raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
+
+    return _load_model(
+        "cheng2020-ada", metric, quality, pretrained, progress, **kwargs
     )
 
 

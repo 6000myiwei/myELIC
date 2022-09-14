@@ -32,4 +32,4 @@ from .waseda import *
 from .tinylic import *
 from .elic import ELIC
 from .elic_vq import ELIC_VQ
-from .elic_ada3 import ELIC_ADA
+from .elic_ada5 import ELIC_ADA

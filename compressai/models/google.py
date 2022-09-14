@@ -105,7 +105,7 @@ class CompressionModel(nn.Module):
             updated |= rv
         return updated
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=False):
         # Dynamically update the entropy bottleneck buffers related to the CDFs
         update_registered_buffers(
             self.entropy_bottleneck,
@@ -113,7 +113,7 @@ class CompressionModel(nn.Module):
             ["_quantized_cdf", "_offset", "_cdf_length"],
             state_dict,
         )
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, strict=strict)
 
 
 class FactorizedPrior(CompressionModel):
@@ -274,14 +274,14 @@ class ScaleHyperprior(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, strict=False):
         update_registered_buffers(
             self.gaussian_conditional,
             "gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, strict=strict)
 
     @classmethod
     def from_state_dict(cls, state_dict):

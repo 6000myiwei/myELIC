@@ -53,8 +53,16 @@ from compressai.zoo import image_models
 # training_stage = [0, 20, 240]
 # double_lambda_trick_epoch = [0, 240]
 
-training_stage = [9999, 0, 40]
-double_lambda_trick_epoch = [0, 40]
+## 0, 1 training one path
+## 1, 2 training stage two
+## 2-later down learning rate, stage2 
+# training_stage = [9999, 100, 120]
+# double_lambda_trick_epoch = [0, 0]
+
+training_stage = [9999, 0, 250]
+double_lambda_trick_epoch = [0,0]
+
+GAMMA = 0.5
 
 
 class RateDistortionLoss(nn.Module):
@@ -235,7 +243,7 @@ def train_one_epoch(
                 f'PSNR: {10 * torch.log10(1 / out_criterion["mse_loss"]).item():.3f} |'
                 f'Bpp loss: {out_criterion["bpp_loss"].item():.4f} | '
                 f"Aux loss: {aux_loss.item():.2f}"
-                # ## ada mask log
+                # # ## ada mask log
                 f"| MASK avr: {out_net['mask'].mean().item():.4f}"
             )
 
@@ -441,14 +449,15 @@ def main(argv):
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     # lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[training_stage[-1]], gamma=0.1)
-    lr_scheduler_aux = optim.lr_scheduler.MultiStepLR(aux_optimizer, milestones=[training_stage[-1]], gamma=0.1)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[training_stage[-1]], gamma=GAMMA)
+    lr_scheduler_aux = optim.lr_scheduler.MultiStepLR(aux_optimizer, milestones=[training_stage[-1]], gamma=GAMMA)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
         logging.info("Loading "+str(args.checkpoint))
         checkpoint = torch.load(args.checkpoint, map_location=device)
         net.load_state_dict(checkpoint["state_dict"], strict=False)
+        # net.load_state_dict(checkpoint, strict=False)
         # if FIXZ:
         #     net.fixed_module(["entropy_bottleneck"])
         # if hasattr(net.y_entorpy, 'skipIndex'):
@@ -499,6 +508,8 @@ def main(argv):
             lmbda_value = double_lambda_value
             criterion.lmbda = lmbda_value
         else:
+            if epoch == double_lambda_trick_epoch[1]:
+                best_loss = float("inf")
             lmbda_value = args.lmbda
             criterion.lmbda = lmbda_value
         logging.info(f"using lambda: {lmbda_value}")

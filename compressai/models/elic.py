@@ -454,7 +454,7 @@ class ELIC(nn.Module):
         print("fixed submodule : \n" + str(fixed_submodule))
         print("trainable submodule : \n" + str(trainable_submodule))
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=False):
         # Dynamically update the entropy bottleneck buffers related to the CDFs
         update_registered_buffers(
             self.entropy_bottleneck,
@@ -615,6 +615,9 @@ class ELIC(nn.Module):
             mu_hat, sigma_hat = torch.chunk(self.y_parameter._sub_modules[0](torch.cat([y_sp1_ctx, hyper], 1)), 2, 1)
             mu_list.append(mu_hat)
             sigma_list.append(sigma_hat) 
+
+            first_mu = [mu, mu_hat]
+            first_sigma = [sigma, sigma_hat]
             
             # y_slices = self.ste_quant(y_slices - mu_hat) + mu_hat
             y_slices = self.y_entorpy.quantize(y_slices, "dequantize", means=mu_hat, scales=sigma_hat)
@@ -673,7 +676,9 @@ class ELIC(nn.Module):
             return {
                 "strings": [*y_string_list, z_strings],
                 "shape": z.size()[-2:],
-                "y" : y_slices if self.stage == CodecStageEnum.Check else None
+                "y" : y_slices if self.stage == CodecStageEnum.Check else None,
+                "first_mu":first_mu if self.stage == CodecStageEnum.Check else None, 
+                "first_sigma":first_sigma if self.stage == CodecStageEnum.Check else None,
             }
     
     @torch.inference_mode()
@@ -826,6 +831,32 @@ if __name__ == "__main__":
     print(res['bpp_loss'].item())
     print(10 * torch.log10(1 / res["mse_loss"]).item())
     print(res['loss'])
+
+    s1, s2 = code['first_sigma'][0].clone(), code['first_sigma'][1].clone()
+    s1[..., 0::2, 0::2] = 0
+    s1[..., 1::2, 1::2] = 0
+    s2[..., 0::2, 0::2] = 0
+    s2[..., 1::2, 1::2] = 0
+
+    
+    m1, m2 = code['first_mu'][0].clone(), code['first_mu'][1].clone()
+    m1[..., 0::2, 0::2] = 0
+    m1[..., 1::2, 1::2] = 0
+    m2[..., 0::2, 0::2] = 0
+    m2[..., 1::2, 1::2] = 0
+
+    s1_pos = s1 <= 0.1592
+    s2_pos = s2 <= 0.1592
+    
+    s1[~s1_pos] = 0
+    s2[~s2_pos] = 0
+    import seaborn as sns
+    sns.heatmap((s2-s1)[0,0,...].cpu())
+    sns.heatmap((m2-m1)[0,0,...].cpu())
+    
+    wrong_pos = s1_pos ^ s2_pos
+    s2[s1==s1[wrong_pos].max()]
+    
 #%%
     # import matplotlib.pyplot as plt
     # y = out['y']
