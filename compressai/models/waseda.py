@@ -42,10 +42,15 @@ from compressai.layers import (
 from compressai.layers.quant import STEQuant
 from compressai.models.elic import CheckerboardContext, CodecStageEnum, ParamGroup, ParamGroupTwoPath
 from compressai.models.utils import CheckerboardMux, CheckerboardDemux, update_registered_buffers
+from compressai.entropy_models import GaussianConditionalEntropySkip
 
 from compressai.models.google import JointAutoregressiveHierarchicalPriors
 
 from compressai.models.elic_ada5 import AdaptiveContext, GetMask, PoolConv
+
+
+SKIP_INDEX = -1
+SKIP_THRESHOLD = [0.1101, 0.1245, 0.1408, 0.1592, 0.1801, 0.2036, 0.2303, 0.2604, 0.2945, 0.3330]
 
 class Cheng2020Anchor(JointAutoregressiveHierarchicalPriors):
     """Anchor model variant from `"Learned Image Compression with
@@ -179,38 +184,45 @@ class Cheng20Checkerboard(Cheng2020Attention):
         super().__init__(N=N, **kwargs)
         
         M = N
+        self.skip_index = SKIP_INDEX
+        print("skip index: ", self.skip_index)
+        self.gaussian_conditional = GaussianConditionalEntropySkip(None, skipIndex=self.skip_index)
         self.context_prediction = CheckerboardContext(
             M, 2 * M, kernel_size=5, padding=2, stride=1, bias=True
         )
         self.Mux = CheckerboardMux
         self.Demux = CheckerboardDemux
         self.stage = stage
-        self.ste_quant = STEQuant()
     
     def forward(self, x):
         y = self.g_a(x)
         z = self.h_a(y)
-        z_round = self.ste_quant(z)
+        # z_round = self.ste_quant(z)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         y_hat = self.gaussian_conditional.quantize(
             y, "noise" if self.training else "dequantize"
         )
-        y_round = self.ste_quant(y)
-        # hyper_params = self.h_s(z_hat)
-        hyper_params = self.h_s(z_round)
-        ctx_params = self.context_prediction(y_round, CodecStageEnum.TRAIN2)
+
+        # y_round = self.ste_quant(y)
+        # hyper_params = self.h_s(z_round)
+        
+        hyper_params = self.h_s(z_hat)
+        ctx_params = self.context_prediction(y_hat, CodecStageEnum.TRAIN2)
         # mask anchor
         ctx_params[:, :, 0::2, 0::2] = 0
         ctx_params[:, :, 1::2, 1::2] = 0
-        gaussian_params = self.entropy_parameters(torch.cat([ctx_params, hyper_params], dim=1))
+        gaussian_params = self.entropy_parameters(torch.cat([hyper_params, ctx_params], dim=1))
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
-        x_hat = self.g_s(y_round)
+
+        # skip_pos = scales_hat <= self.gaussian_conditional.skipThreshold
+        # y_hat = ~skip_pos * y_hat + skip_pos * means_hat
+
+        x_hat = self.g_s(y_hat)
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
-
     # def forward(self, x):
     #     if self.stage == CodecStageEnum.TRAIN:
     #         y = self.g_a(x)
@@ -218,9 +230,14 @@ class Cheng20Checkerboard(Cheng2020Attention):
     #         z_hat, z_likelihoods = self.entropy_bottleneck(z)
     #         params = self.h_s(z_hat)
 
+    #         # z_round = self.ste_quant(z)
+    #         # params = self.h_s(z_round)
+
     #         y_hat = self.gaussian_conditional.quantize(
     #             y, "noise" if self.training else "dequantize"
     #         )
+
+    #         # y_hat = self.ste_quant(y)
     #         ctx_params = self.context_prediction(y_hat, self.stage)
             
     #         gaussian_params1 = self.entropy_parameters(
@@ -235,6 +252,8 @@ class Cheng20Checkerboard(Cheng2020Attention):
             
     #         _, y_likelihoods1 = self.gaussian_conditional(y, scales_hat1, means=means_hat1)
     #         _, y_likelihoods2 = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
+    #         skip_pos = scales_hat2 <= self.gaussian_conditional.skipThreshold
+    #         y_hat = y_hat * ~skip_pos + skip_pos * means_hat2
     #         x_hat = self.g_s(y_hat)
 
     #         return {
@@ -300,7 +319,7 @@ class Cheng20Checkerboard(Cheng2020Attention):
         scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
 
         # set y_hat non anchor part to zero
-        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
+        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1, scales=scales_hat1)
         y_anchor[..., 0::2, 1::2] = 0
         y_anchor[..., 1::2, 0::2] = 0
         
@@ -314,7 +333,7 @@ class Cheng20Checkerboard(Cheng2020Attention):
         )
         
         scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2, scales=scales_hat2)
         
         y1, y2 = self.Demux(y_hat)
         mu1, mu2 = self.Demux(means_hat2)
@@ -374,65 +393,100 @@ class Cheng20ADA(Cheng20Checkerboard):
     def __init__(self, N=192, stage=CodecStageEnum.TRAIN, **kwargs):
         super().__init__(N, stage, **kwargs)
         M = N
+
+        index = 5
+        print("skip threshold: ", index)
+        self.threshold = SKIP_THRESHOLD[index]
+        # self.threshold = -100
+
+        self.skip_index = SKIP_INDEX
+        print("skip_inex:", self.skip_index)
+        self.gaussian_conditional = GaussianConditionalEntropySkip(None, skipIndex=self.skip_index)
+        # self.gaussian_conditional = GaussianConditional(None)
+
         self.context_prediction = AdaptiveContext(M, 2 * M, 5)
-        self.ada_mask = GetMask()
+        
+        self.ada_mask = GetMask(self.threshold)
         self.pool_conv = PoolConv(M)
-        self.ste_qunat = STEQuant()
+
+        # self.ada_mask = GetMask2(self.threshold)
+        # self.pool_conv = PoolConv3(M)
+        
+        # self.pool_conv_sigma = PoolConv_sigma(M)
+        # self.ste_qunat = STEQuant()
+        self.stage = stage
     
     def fill_pooling_value(self, y_anchor, mu, sigma, values_mask):
         values = mu * values_mask
         values = self.pool_conv(values)
         return values + y_anchor
+
+        # mu_values = self.pool_conv(mu * values_mask)
+        # sigma_values = self.pool_conv_sigma(sigma * values_mask)
+        # return y_anchor + mu_values + sigma_values
     
     def forward(self, x):
-            y = self.g_a(x)
-            z = self.h_a(y)
-            z_hat, z_likelihoods = self.entropy_bottleneck(z)
-            params = self.h_s(z_hat)
+        y = self.g_a(x)
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        params = self.h_s(z_hat)
 
-            # z_round = self.ste_qunat(z)
-            # params = self.h_s(z_round)
-            
-            shape_in = y.shape
-            y_hat = self.gaussian_conditional.quantize(
-                y, "noise" if self.training else "dequantize"
-            )
-            zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
-            
-            gaussian_params1 = self.entropy_parameters(
-                torch.cat((params, zero_ctx), dim=1)
-            )
-            scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
-            mask = self.ada_mask(scales_hat1)
-            
-            # set y_hat non anchor part to zero
-            # y_anchor = self.ste_qunat(y - means_hat1) + means_hat1
-            y_anchor = y_hat.clone()
-            y_anchor *= mask[0]
-            y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
-            
-            ctx_params = self.context_prediction(y_anchor, self.stage)
-            # set ctx anchor part ctx to zero
-            
-            gaussian_params2 = self.entropy_parameters(
-                torch.cat((params, ctx_params), dim=1)
-            )
-            
-            scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
-            scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
-            means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
-            
-            _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
-            x_hat = self.g_s(y_hat)
+        # z_round = self.ste_qunat(z)
+        # params = self.h_s(z_round)
+        
+        shape_in = y.shape
+        y_hat = self.gaussian_conditional.quantize(
+            y, "noise" if self.training else "dequantize"
+        )
+        zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
+        
+        gaussian_params1 = self.entropy_parameters(
+            torch.cat((params, zero_ctx), dim=1)
+        )
+        scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
+        mask = self.ada_mask(scales_hat1)
+        
+        # set y_hat non anchor part to zero
+        # y_anchor = self.ste_quant(y, means=means_hat1, scales=scales_hat1)
+        y_anchor = y_hat.clone()
+        y_anchor *= mask[0]
+        y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
+        
+        ctx_params = self.context_prediction(y_anchor, self.stage)
+        
+        gaussian_params2 = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        
+        # set ctx anchor part ctx to zero
+        scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
+        scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
+        means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
+        
+        _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
 
+        if self.skip_index > 0:
+            skip_pos = scales_hat2 <= self.gaussian_conditional.skipThreshold
+            y_hat = ~skip_pos * y_hat + skip_pos * means_hat2
+        else:
+            ## partial skip
+            y_hat_skip = y_hat * (1 - mask[1]) + means_hat2 * mask[1]
+            y_hat = (y_hat + y_hat_skip) / 2
+        
+        # y_likelihoods = y_likelihoods * (1 - mask[1]) + torch.ones_like(y_likelihoods) * mask[1]
+        
+        x_hat = self.g_s(y_hat)
+
+        # y_quant = self.ste_qunat(y - means_hat2) + means_hat2 
             # y_quant = self.ste_qunat(y - means_hat2) + means_hat2    
-            # x_hat = self.g_s(y_quant)
-            return {
-                "y":y,
-                "x_hat": x_hat,
-                "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
-                "mask": mask[0]
-            }
+        # y_quant = self.ste_qunat(y - means_hat2) + means_hat2 
+        # x_hat = self.g_s(y_quant)
+        return {
+            "y":y,
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
+            "mask": mask[0]
+        }
     
     def compress(self, x):
         y = self.g_a(x)
@@ -457,7 +511,8 @@ class Cheng20ADA(Cheng20Checkerboard):
         non_anchor_index = ~anchor_index
 
         # set y_hat non anchor part to zero
-        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
+        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1, scales=scales_hat1)
+        # y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
         y_anchor *= mask[0]
         y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
         
@@ -471,7 +526,13 @@ class Cheng20ADA(Cheng20Checkerboard):
         scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
         means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
         
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2, scales=scales_hat2)
+        # y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        
+        ## partial skip
+        # y_hat_skip = y_hat * (1 - mask[1]) + means_hat2 * mask[1]
+        # y_hat = (y_hat_skip + y_hat) / 2
+        
         
         y1, y2 = y_hat[:, anchor_index[0]], y_hat[:, non_anchor_index[0]]
         mu1, mu2 = means_hat2[:, anchor_index[0]], means_hat2[:, non_anchor_index[0]]

@@ -36,7 +36,6 @@ import os
 import time
 import logging
 from datetime import datetime
-from black import out
 
 import torch
 import torch.nn as nn
@@ -59,10 +58,10 @@ from compressai.zoo import image_models
 # training_stage = [9999, 100, 120]
 # double_lambda_trick_epoch = [0, 0]
 
-training_stage = [9999, 0, 250]
+training_stage = [9999, 0, 0]
 double_lambda_trick_epoch = [0,0]
 
-GAMMA = 0.5
+GAMMA = 0.1
 
 
 class RateDistortionLoss(nn.Module):
@@ -279,6 +278,40 @@ def test_epoch(epoch, test_dataloader, model, criterion):
 
     return loss.avg
 
+def test_epoch_showmask(epoch, test_dataloader, model, criterion):
+    model.eval()
+    device = next(model.parameters()).device
+
+    loss = AverageMeter()
+    bpp_loss = AverageMeter()
+    mse_loss = AverageMeter()
+    aux_loss = AverageMeter()
+    mask = AverageMeter()
+
+    with torch.no_grad():
+        for d in test_dataloader:
+            d = d.to(device)
+            out_net = model(d)
+            out_criterion = criterion(out_net, d)
+
+            aux_loss.update(model.aux_loss())
+            bpp_loss.update(out_criterion["bpp_loss"])
+            loss.update(out_criterion["loss"])
+            mse_loss.update(out_criterion["mse_loss"])
+            mask.update(out_net['mask'].mean())
+
+    logging.info(
+        f"Average losses: "
+        f"Loss: {loss.avg:.3f} | "
+        f"MSE loss: {mse_loss.avg:.5f} | "
+        f"PSNR: {10 * torch.log10(1 / mse_loss.avg).item():.3f} | "
+        f"Bpp loss: {bpp_loss.avg:.4f} | "
+        f"Mask avr: {mask.avg:.4f} | " 
+        f"Aux loss: {aux_loss.avg:.2f} \n |"
+    )
+
+    return loss.avg
+
 
 def save_checkpoint(state, is_best, base_dir, filename="checkpoint.pth.tar"):
     torch.save(state, base_dir+filename)
@@ -389,9 +422,10 @@ def parse_args(argv):
 def main(argv):
     args = parse_args(argv)
     base_dir = init(args)
-    double_lambda_value = args.lmbda / 2
     ## set to 0.015 for low bitrate model
-    # double_lambda_value = 0.015
+    if double_lambda_trick_epoch[1] > 0: 
+        # double_lambda_value = 0.015
+        double_lambda_value = args.lmbda / 2
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -456,7 +490,7 @@ def main(argv):
     if args.checkpoint:  # load from previous checkpoint
         logging.info("Loading "+str(args.checkpoint))
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        net.load_state_dict(checkpoint["state_dict"], strict=False)
+        net.load_state_dict(checkpoint["state_dict"], strict=True)
         # net.load_state_dict(checkpoint, strict=False)
         # if FIXZ:
         #     net.fixed_module(["entropy_bottleneck"])
@@ -476,15 +510,12 @@ def main(argv):
         
         ## Temp Hack lr scheduler
         # del checkpoint['lr_scheduler']['milestones']
+        # del checkpoint['lr_scheduler_aux']['milestones']
         # checkpoint['lr_scheduler']['_last_lr'] = args.learning_rate
+        # checkpoint['lr_scheduler_aux']['_last_lr'] = args.aux_learning_rate
         
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        
-        # checkpoint['lr_scheduler']['base_lrs'] = args.aux_learning_rate
-        # checkpoint['lr_scheduler']['_last_lr'] = args.aux_learning_rate
-        
-        # TODO add aux lr scheduler loader
-        lr_scheduler_aux.load_state_dict(checkpoint["lr_scheduler"])
+        lr_scheduler_aux.load_state_dict(checkpoint["lr_scheduler_aux"])
     
     lmbda_value = double_lambda_value if last_epoch >= double_lambda_trick_epoch[0] and last_epoch < double_lambda_trick_epoch[1] else args.lmbda
     criterion = RateDistortionLossTwoPath(lmbda=lmbda_value)
@@ -523,7 +554,8 @@ def main(argv):
             epoch,
             args.clip_max_norm,
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
+        # loss = test_epoch(epoch, test_dataloader, net, criterion)
+        loss = test_epoch_showmask(epoch, test_dataloader, net, criterion)
         lr_scheduler.step()
         lr_scheduler_aux.step()
 

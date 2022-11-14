@@ -1,28 +1,25 @@
-from codecs import Codec
 import torch
 import torch.nn as nn
+import  torch.nn.functional as F
 
-from compressai.layers import (
-    AttentionBlock,
-    ResidualBlock,
-    ResidualBlockUpsample,
-    ResidualBlockWithStride,
-    conv3x3,
-    subpel_conv3x3,
-)
-from compressai.layers.quant import STEQuant
+from compressai.layers.quant import STEQuant, STEQuantWithSkip
 from compressai.models.elic import CheckerboardContext, CodecStageEnum, ParamGroup, ParamGroupTwoPath
 from compressai.models.utils import CheckerboardMux, CheckerboardDemux, update_registered_buffers
 
 from compressai.models.google import JointAutoregressiveHierarchicalPriors
 
-from compressai.models.elic_ada5 import AdaptiveContext, GetMask, PoolConv
+from compressai.models.elic_ada5 import AdaptiveContext, GetMask, PoolConv, PoolConv2
+from compressai.entropy_models import GaussianConditionalEntropySkip, GaussianConditional
 
+SKIP_INDEX = -1
+SKIP_THRESHOLD = [0.1101, 0.1245, 0.1408, 0.1592, 0.1801, 0.2036, 0.2303, 0.2604, 0.2945, 0.3330]
 
 class Minen18Checkerboard(JointAutoregressiveHierarchicalPriors):
     def __init__(self, N=192, M=192, stage=CodecStageEnum.TRAIN, **kwargs):
         super().__init__(N=N, M=M, **kwargs)
         
+        self.skip_index = SKIP_INDEX
+        self.gaussian_conditional = GaussianConditionalEntropySkip(None, skipIndex=self.skip_index)
         self.context_prediction = CheckerboardContext(
             M, 2 * M, kernel_size=5, padding=2, stride=1, bias=True
         )
@@ -31,99 +28,112 @@ class Minen18Checkerboard(JointAutoregressiveHierarchicalPriors):
         self.stage = stage
         self.ste_quant = STEQuant()
     
-    # def forward(self, x):
-    #     y = self.g_a(x)
-    #     z = self.h_a(y)
-    #     z_round = self.ste_quant(z)
-    #     z_hat, z_likelihoods = self.entropy_bottleneck(z)
-    #     y_hat = self.gaussian_conditional.quantize(
-    #         y, "noise" if self.training else "dequantize"
-    #     )
-    #     y_round = self.ste_quant(y)
-    #     # hyper_params = self.h_s(z_hat)
-    #     hyper_params = self.h_s(z_round)
-    #     ctx_params = self.context_prediction(y_round, CodecStageEnum.TRAIN2)
-    #     # mask anchor
-    #     ctx_params[:, :, 0::2, 0::2] = 0
-    #     ctx_params[:, :, 1::2, 1::2] = 0
-    #     gaussian_params = self.entropy_parameters(torch.cat([ctx_params, hyper_params], dim=1))
-    #     scales_hat, means_hat = gaussian_params.chunk(2, 1)
-    #     _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
-    #     x_hat = self.g_s(y_round)
-    #     return {
-    #         "x_hat": x_hat,
-    #         "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-    #     }
-
     def forward(self, x):
-        if self.stage == CodecStageEnum.TRAIN:
-            y = self.g_a(x)
-            z = self.h_a(y)
-            z_hat, z_likelihoods = self.entropy_bottleneck(z)
-            params = self.h_s(z_hat)
+        y = self.g_a(x)
+        z = self.h_a(y)
+        # z_round = self.ste_quant(z)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        y_hat = self.gaussian_conditional.quantize(
+            y, "noise" if self.training else "dequantize"
+        )
 
-            y_hat = self.gaussian_conditional.quantize(
-                y, "noise" if self.training else "dequantize"
-            )
-            ctx_params = self.context_prediction(y_hat, self.stage)
-            
-            gaussian_params1 = self.entropy_parameters(
-                torch.cat((params, ctx_params[0]), dim=1)
-            )
-            scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
-            
-            gaussian_params2 = self.entropy_parameters(
-                torch.cat((params, ctx_params[1]), dim=1)
-            )
-            scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
-            
-            _, y_likelihoods1 = self.gaussian_conditional(y, scales_hat1, means=means_hat1)
-            _, y_likelihoods2 = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
-            x_hat = self.g_s(y_hat)
+        # y_round = self.ste_quant(y)
+        # hyper_params = self.h_s(z_round)
+        
+        hyper_params = self.h_s(z_hat)
+        ctx_params = self.context_prediction(y_hat, CodecStageEnum.TRAIN2)
+        # mask anchor
+        ctx_params[:, :, 0::2, 0::2] = 0
+        ctx_params[:, :, 1::2, 1::2] = 0
+        gaussian_params = self.entropy_parameters(torch.cat([hyper_params, ctx_params], dim=1))
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
 
-            return {
-                "x_hat": x_hat,
-                "likelihoods": {"y1": y_likelihoods1, "y2": y_likelihoods2,"z": z_likelihoods},
-            }
-        elif self.stage == CodecStageEnum.TRAIN2:
-            y = self.g_a(x)
-            z = self.h_a(y)
-            z_hat, z_likelihoods = self.entropy_bottleneck(z)
-            params = self.h_s(z_hat)
+        skip_pos = scales_hat <= self.gaussian_conditional.skipThreshold
+        y_hat = ~skip_pos * y_hat + skip_pos * means_hat
+
+        x_hat = self.g_s(y_hat)
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+        }
+
+    # def forward(self, x):
+    #     if self.stage == CodecStageEnum.TRAIN:
+    #         y = self.g_a(x)
+    #         z = self.h_a(y)
+    #         z_hat, z_likelihoods = self.entropy_bottleneck(z)
+    #         params = self.h_s(z_hat)
+
+    #         # z_round = self.ste_quant(z)
+    #         # params = self.h_s(z_round)
+
+    #         y_hat = self.gaussian_conditional.quantize(
+    #             y, "noise" if self.training else "dequantize"
+    #         )
+
+    #         # y_hat = self.ste_quant(y)
+    #         ctx_params = self.context_prediction(y_hat, self.stage)
             
-            shape_in = y.shape
-            y_hat = self.gaussian_conditional.quantize(
-                y, "noise" if self.training else "dequantize"
-            )
-            zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
+    #         gaussian_params1 = self.entropy_parameters(
+    #             torch.cat((params, ctx_params[0]), dim=1)
+    #         )
+    #         scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
             
-            gaussian_params1 = self.entropy_parameters(
-                torch.cat((params, zero_ctx), dim=1)
-            )
-            scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
+    #         gaussian_params2 = self.entropy_parameters(
+    #             torch.cat((params, ctx_params[1]), dim=1)
+    #         )
+    #         scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
             
-            # set y_hat non anchor part to zero
-            y_anchor = y_hat.clone()
-            y_anchor[..., 0::2, 1::2] = 0
-            y_anchor[..., 1::2, 0::2] = 0
+    #         _, y_likelihoods1 = self.gaussian_conditional(y, scales_hat1, means=means_hat1)
+    #         _, y_likelihoods2 = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
+    #         skip_pos = scales_hat2 <= self.gaussian_conditional.skipThreshold
+    #         y_hat = y_hat * ~skip_pos + skip_pos * means_hat2
+    #         x_hat = self.g_s(y_hat)
+
+    #         return {
+    #             "x_hat": x_hat,
+    #             "likelihoods": {"y1": y_likelihoods1, "y2": y_likelihoods2,"z": z_likelihoods},
+    #         }
+    #     elif self.stage == CodecStageEnum.TRAIN2:
+    #         y = self.g_a(x)
+    #         z = self.h_a(y)
+    #         z_hat, z_likelihoods = self.entropy_bottleneck(z)
+    #         params = self.h_s(z_hat)
             
-            ctx_params = self.context_prediction(y_anchor, self.stage)
-            # set ctx anchor part ctx to zero
-            ctx_params[..., 0::2, 0::2] = 0
-            ctx_params[..., 1::2, 1::2] = 0
+    #         shape_in = y.shape
+    #         y_hat = self.gaussian_conditional.quantize(
+    #             y, "noise" if self.training else "dequantize"
+    #         )
+    #         zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
             
-            gaussian_params2 = self.entropy_parameters(
-                torch.cat((params, ctx_params), dim=1)
-            )
+    #         gaussian_params1 = self.entropy_parameters(
+    #             torch.cat((params, zero_ctx), dim=1)
+    #         )
+    #         scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
             
-            scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
+    #         # set y_hat non anchor part to zero
+    #         y_anchor = y_hat.clone()
+    #         y_anchor[..., 0::2, 1::2] = 0
+    #         y_anchor[..., 1::2, 0::2] = 0
             
-            _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
-            x_hat = self.g_s(y_hat)
-            return {
-                "x_hat": x_hat,
-                "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
-            }
+    #         ctx_params = self.context_prediction(y_anchor, self.stage)
+    #         # set ctx anchor part ctx to zero
+    #         ctx_params[..., 0::2, 0::2] = 0
+    #         ctx_params[..., 1::2, 1::2] = 0
+            
+    #         gaussian_params2 = self.entropy_parameters(
+    #             torch.cat((params, ctx_params), dim=1)
+    #         )
+            
+    #         scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
+            
+    #         _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
+    #         x_hat = self.g_s(y_hat)
+    #         return {
+    #             "x_hat": x_hat,
+    #             "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
+    #         }
 
     def compress(self, x):
         y = self.g_a(x)
@@ -144,7 +154,7 @@ class Minen18Checkerboard(JointAutoregressiveHierarchicalPriors):
         scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
 
         # set y_hat non anchor part to zero
-        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
+        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1, scales=scales_hat1)
         y_anchor[..., 0::2, 1::2] = 0
         y_anchor[..., 1::2, 0::2] = 0
         
@@ -158,7 +168,7 @@ class Minen18Checkerboard(JointAutoregressiveHierarchicalPriors):
         )
         
         scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2, scales=scales_hat2)
         
         y1, y2 = self.Demux(y_hat)
         mu1, mu2 = self.Demux(means_hat2)
@@ -214,69 +224,168 @@ class Minen18Checkerboard(JointAutoregressiveHierarchicalPriors):
         }
 
 
+
+# class PoolConv_sigma(nn.Module):
+#     def __init__(self, channels) -> None:
+#         super().__init__()
+#         weight = torch.zeros(3,3)
+#         weight[1,2] = -0.5
+#         weight[2,1] = 0.5
+#         self.channels = channels
+#         repeat = lambda x:x.repeat(channels, 1, 1, 1)
+#         self.register_buffer("weight", repeat(weight), persistent=False) 
+        
+#     def forward(self, x):
+#         values = F.conv2d(x, self.weight, bias=None, stride=1, padding=1, groups=self.channels)
+#         return values
+
+# class PoolConv3(nn.Conv2d):
+#     r"""Masked 2D convolution implementation, mask future "unseen" pixels.
+#     Checkerboard Pattern
+#     """
+
+#     def __init__(self, channel, k_size=3):
+#         super().__init__(channel, channel, k_size, 1, 1, bias=False)
+#         size = self.kernel_size[0]
+#         row_odd = [0., 1.] * (size // 2) + [0.]  # 0 1 0 1 ... 0
+#         row_even = [1., 0.] * (size // 2) + [1.]  # 1 0 1 0 ... 1
+#         mask = [row_odd, row_even] * (size // 2) + [row_odd]
+#         mask = torch.Tensor(mask).to(self.weight.data.device)      
+        
+#         self.register_buffer("mask", mask)
+        
+
+#     def forward(self, x):
+#         # TODO(begaintj): weight assigment is not supported by torchscript
+#         self.weight.data *= self.mask
+#         return super().forward(x)
+
+# class GetMask2(GetMask):
+#     def forward(self, sigma):
+#         h = sigma
+
+#         B,C,H,W = h.shape
+        
+#         mask = torch.zeros(B, C, H, W).to(sigma.device)
+#         mask[..., 0::2, 0::2] = 1
+#         mask[..., 1::2, 1::2] = 1
+
+#         # threshold = h.view(B, C, -1).median(dim=-1, keepdim=True)[0]
+#         # threshold.unsqueeze_(-1)
+#         # threshold = torch.where(threshold <= self.threshold, threshold, self.threshold)
+#         # pool_pos = h <= threshold
+#         pool_pos = h <= self.threshold
+#         pool_pos[..., 0::2, 0::2] = False
+#         pool_pos[..., 1::2, 1::2] = False
+        
+#         bottom, top, left, right = GetMask.find4neigh(torch.argwhere(pool_pos), H, W)
+#         mask[top[:, 0], top[:, 1], top[:,2], top[:, 3]] = 0
+#         mask[left[:, 0], left[:, 1], left[:,2], left[:, 3]] = 0
+#         mask[bottom[:, 0], bottom[:, 1], bottom[:,2], bottom[:, 3]] = 0
+#         mask[right[:, 0], right[:, 1], right[:,2], right[:, 3]] = 0
+        
+#         values_pos = pool_pos
+        
+#         return mask, values_pos.int()
+
+
 class Minen18ADA(Minen18Checkerboard):
     def __init__(self, N=192, M=192, stage=CodecStageEnum.TRAIN, **kwargs):
         super().__init__(N=N, M=M, **kwargs)
+        index = 1
+        print("skip threshold: ", index)
+        self.threshold = SKIP_THRESHOLD[index]
+        # self.threshold = -100
+        # self.threshold = 0.1592
+
+        self.skip_index = SKIP_INDEX
+        print("skip index: ", self.skip_index)
+        self.gaussian_conditional = GaussianConditionalEntropySkip(None, skipIndex=self.skip_index)
+        # self.gaussian_conditional = GaussianConditional(None)
+
         self.context_prediction = AdaptiveContext(M, 2 * M, 5)
-        self.ada_mask = GetMask()
+        
+        self.ada_mask = GetMask(self.threshold)
         self.pool_conv = PoolConv(M)
-        self.ste_qunat = STEQuant()
+
+        # self.ada_mask = GetMask2(self.threshold)
+        # self.pool_conv = PoolConv3(M)
+        
+        # self.pool_conv_sigma = PoolConv_sigma(M)
+        # self.ste_qunat = STEQuant()
+        self.ste_quant = STEQuantWithSkip(self.gaussian_conditional.skipThreshold)
         self.stage = stage
     
     def fill_pooling_value(self, y_anchor, mu, sigma, values_mask):
         values = mu * values_mask
         values = self.pool_conv(values)
         return values + y_anchor
+
+        # mu_values = self.pool_conv(mu * values_mask)
+        # sigma_values = self.pool_conv_sigma(sigma * values_mask)
+        # return y_anchor + mu_values + sigma_values
     
     def forward(self, x):
-            y = self.g_a(x)
-            z = self.h_a(y)
-            z_hat, z_likelihoods = self.entropy_bottleneck(z)
-            params = self.h_s(z_hat)
+        y = self.g_a(x)
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        params = self.h_s(z_hat)
 
-            # z_round = self.ste_qunat(z)
-            # params = self.h_s(z_round)
-            
-            shape_in = y.shape
-            y_hat = self.gaussian_conditional.quantize(
-                y, "noise" if self.training else "dequantize"
-            )
-            zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
-            
-            gaussian_params1 = self.entropy_parameters(
-                torch.cat((params, zero_ctx), dim=1)
-            )
-            scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
-            mask = self.ada_mask(scales_hat1)
-            
-            # set y_hat non anchor part to zero
-            # y_anchor = self.ste_qunat(y - means_hat1) + means_hat1
-            y_anchor = y_hat.clone()
-            y_anchor *= mask[0]
-            y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
-            
-            ctx_params = self.context_prediction(y_anchor, self.stage)
-            # set ctx anchor part ctx to zero
-            
-            gaussian_params2 = self.entropy_parameters(
-                torch.cat((params, ctx_params), dim=1)
-            )
-            
-            scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
-            scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
-            means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
-            
-            _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
-            x_hat = self.g_s(y_hat)
+        # z_round = self.ste_qunat(z)
+        # params = self.h_s(z_round)
+        
+        shape_in = y.shape
+        y_hat = self.gaussian_conditional.quantize(
+            y, "noise" if self.training else "dequantize"
+        )
+        zero_ctx = torch.zeros(shape_in[0], shape_in[1] * 2, shape_in[2], shape_in[3]).to(y.device)
+        
+        gaussian_params1 = self.entropy_parameters(
+            torch.cat((params, zero_ctx), dim=1)
+        )
+        scales_hat1, means_hat1 = gaussian_params1.chunk(2, 1)
+        mask = self.ada_mask(scales_hat1)
+        
+        # set y_hat non anchor part to zero
+        # y_anchor = self.ste_quant(y, means=means_hat1, scales=scales_hat1)
+        y_anchor = y_hat.clone()
+        y_anchor *= mask[0]
+        y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
+        
+        ctx_params = self.context_prediction(y_anchor, self.stage)
+        
+        gaussian_params2 = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        
+        # set ctx anchor part ctx to zero
+        scales_hat2, means_hat2 = gaussian_params2.chunk(2, 1)
+        scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
+        means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
+        
+        _, y_likelihoods = self.gaussian_conditional(y, scales_hat2, means=means_hat2)
 
-            # y_quant = self.ste_qunat(y - means_hat2) + means_hat2    
-            # x_hat = self.g_s(y_quant)
-            return {
-                "y":y,
-                "x_hat": x_hat,
-                "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
-                "mask": mask[0]
-            }
+        if self.skip_index > 0:
+            skip_pos = scales_hat2 <= self.gaussian_conditional.skipThreshold
+            y_hat = ~skip_pos * y_hat + skip_pos * means_hat2
+        else:
+            ## partial skip
+            # y_hat_skip = y_hat * (1 - mask[1]) + means_hat2 * mask[1]
+            # y_hat = (y_hat + y_hat_skip) / 2
+            pass
+        
+        # y_likelihoods = y_likelihoods * (1 - mask[1]) + torch.ones_like(y_likelihoods) * mask[1]
+        
+        x_hat = self.g_s(y_hat)
+
+        # y_quant = self.ste_qunat(y - means_hat2) + means_hat2 
+        # x_hat = self.g_s(y_quant)
+        return {
+            "y":y,
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods,"z": z_likelihoods},
+            "mask": mask[0]
+        }
     
     def compress(self, x):
         y = self.g_a(x)
@@ -301,7 +410,8 @@ class Minen18ADA(Minen18Checkerboard):
         non_anchor_index = ~anchor_index
 
         # set y_hat non anchor part to zero
-        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
+        y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1, scales=scales_hat1)
+        # y_anchor = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat1)
         y_anchor *= mask[0]
         y_anchor = self.fill_pooling_value(y_anchor, means_hat1, scales_hat1, mask[1])
         
@@ -315,7 +425,13 @@ class Minen18ADA(Minen18Checkerboard):
         scales_hat2 = scales_hat2 * (1 - mask[0]) + scales_hat1 * mask[0]
         means_hat2 = means_hat2 * (1 - mask[0]) + means_hat1 * mask[0]
         
-        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2, scales=scales_hat2)
+        # y_hat = self.gaussian_conditional.quantize(y, "dequantize", means=means_hat2)
+        
+        ## partial skip
+        # y_hat_skip = y_hat * (1 - mask[1]) + means_hat2 * mask[1]
+        # y_hat = (y_hat_skip + y_hat) / 2
+        
         
         y1, y2 = y_hat[:, anchor_index[0]], y_hat[:, non_anchor_index[0]]
         mu1, mu2 = means_hat2[:, anchor_index[0]], means_hat2[:, non_anchor_index[0]]
@@ -391,12 +507,12 @@ if __name__ == "__main__":
     x = ToTensor()(img).cuda()
     x = x.unsqueeze(0)
     
-    net = Minen18Checkerboard().cuda()
+    net = Minen18ADA(M=320).cuda()
     net.eval()
     net.stage = CodecStageEnum.Check
     
-    # checkpoint = torch.load('pretrained/cheng2020-ada/6/checkpoint.pth.tar')
-    # net.load_state_dict(checkpoint['state_dict'])
+    checkpoint = torch.load('pretrained/minen18-ada/6/skip_best_p.pth.tar')
+    net.load_state_dict(checkpoint['state_dict'])
     
     net.update(force=True)
     
@@ -420,13 +536,13 @@ if __name__ == "__main__":
     print((y1 == y2).all())
     
     
-    # import matplotlib.pyplot as plt
-    # import seaborn as sns
-    # m = out['mask'][0]
-    # y = out['y']
-    # # hyper = out['hyper']
-    # # mu, sigma = out["first_param"]
-    # # mu_list, sigma_list = out['param_list']
-    # plt.imshow(y[0,0,...].cpu().detach())
-    # plt.imshow(m[0,0,...].cpu().detach())
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    m = out['mask'][0]
+    y = out['y']
+    # hyper = out['hyper']
+    # mu, sigma = out["first_param"]
+    # mu_list, sigma_list = out['param_list']
+    plt.imshow(y[0,0,...].cpu().detach())
+    plt.imshow(m[0,0,...].cpu().detach())
 #%%

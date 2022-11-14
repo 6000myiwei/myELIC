@@ -255,7 +255,7 @@ cfgs = {
         1: (192, 192),
         2: (192, 192),
         3: (192, 192),
-        4: (192, 192),
+        4: (192, 320),
         5: (192, 320),
         6: (192, 320),
         7: (192, 320),
@@ -265,7 +265,7 @@ cfgs = {
         1: (192, 192),
         2: (192, 192),
         3: (192, 192),
-        4: (192, 192),
+        4: (192, 320),
         5: (192, 320),
         6: (192, 320),
         7: (192, 320),
@@ -294,6 +294,8 @@ cfgs = {
         4: (192,),
         5: (192,),
         6: (192,),
+        7: (192,),
+        8: (192,),
     },
     "cheng2020-ada": {
         1: (128,),
@@ -302,6 +304,8 @@ cfgs = {
         4: (192,),
         5: (192,),
         6: (192,),
+        7: (192,),
+        8: (192,),
     },
     "tinylic": {
         1: (128, 192),
@@ -480,7 +484,7 @@ def minen18_checkerboard(quality, metric="mse", pretrained=False, progress=True,
     if metric not in ("mse", "ms-ssim"):
         raise ValueError(f'Invalid metric "{metric}"')
 
-    if quality < 1 or quality > 6:
+    if quality < 1 or quality > 8:
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
 
     return _load_model(
@@ -502,7 +506,7 @@ def minen18_ada(quality, metric="mse", pretrained=False, progress=True, **kwargs
     if metric not in ("mse", "ms-ssim"):
         raise ValueError(f'Invalid metric "{metric}"')
 
-    if quality < 1 or quality > 6:
+    if quality < 1 or quality > 8:
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
 
     return _load_model(
@@ -570,7 +574,7 @@ def cheng2020_checkerboard(quality, metric="mse", pretrained=False, progress=Tru
     if metric not in ("mse", "ms-ssim"):
         raise ValueError(f'Invalid metric "{metric}"')
 
-    if quality < 1 or quality > 6:
+    if quality < 1 or quality > 8:
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
 
     return _load_model(
@@ -592,7 +596,7 @@ def cheng2020_ada(quality, metric="mse", pretrained=False, progress=True, **kwar
     if metric not in ("mse", "ms-ssim"):
         raise ValueError(f'Invalid metric "{metric}"')
 
-    if quality < 1 or quality > 6:
+    if quality < 1 or quality > 8:
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 6)')
 
     return _load_model(
